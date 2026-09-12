@@ -2,21 +2,18 @@
 
 A viewer for windsurfing GPS sessions.
 
-I windsurf as a hobby, and I wanted a quicker way to look at my own tracks
+As a hobby-windsurfer, and I wanted a quicker way to look at my own tracks
 after a session, so I built this. Sharing it in case it's useful to anyone
 else.
 
-<!-- SCREENSHOT: replace this line with a picture of the app with a session
-     loaded. Open a new issue on this repo, drag the image into the comment
-     box, copy the URL GitHub generates, and put  ![GPSFlow](that-url)  here.
-     You don't have to actually submit the issue. -->
+  ![GPSFlow](https://github.com/user-attachments/assets/94b39fb4-a445-4f04-81f1-3d4a195bea72)
+     
 
 ## What it reads
 
 GPX files and Locosys `.sbp` files, which is what my two watches produce.
 
-Other formats can be added — most of these devices write something similar,
-and the work is mostly in figuring out where the fields sit. If you have a
+Other formats can be added. If you have a
 watch that writes something else, open an issue with a sample file.
 
 ## What it shows
@@ -33,16 +30,8 @@ watch that writes something else, open an issue with a sample file.
 
 ## Speed accuracy
 
-Speed comes from the receiver's own Doppler measurement wherever the file has
-it — GPX `<speed>` elements, and every record in an `.sbp` file — rather than
-being worked out from the distance between positions.
-
-This makes a real difference. On a 5 Hz log, position-derived speed throws up
-peaks above 70 knots where the receiver reports 32. Distances for the
-distance categories are integrated from the same source, since GPS noise
-otherwise inflates them by a few percent.
-
 I've checked the numbers against existing session software and they match.
+However there is no build in Interpolation(yet) 
 
 ## Getting it
 
