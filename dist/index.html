@@ -1,0 +1,2672 @@
+<!DOCTYPE html>
+<!--
+  ============================================================================
+  GPSFLOW - GPX and SBP track viewer for windsurfing sessions
+  ============================================================================
+
+  WHAT IT IS
+  A single self-contained HTML file. Drop a .gpx track on it and it shows:
+    - the route on a map, coloured by speed
+    - session totals (distance, duration, top speed, number of runs)
+    - a list of detected "runs" (sustained planing bursts), fastest first
+    - a keyboard-scrubbable speed-vs-time timeline
+
+  No build step, no bundler, no server. Open the file and it works.
+
+  DEPENDENCIES
+    - MapLibre GL JS 4.7 .. map rendering
+    - CARTO vector basemaps (Voyager in light theme, Dark Matter in dark)
+    Everything else - GPX and SBP parsing, speed maths, the timeline chart -
+    is hand-rolled. The timeline in particular is a custom <canvas> renderer
+    rather than a charting library; see the TIMELINE section for why.
+
+    The basemaps are VECTOR rather than raster. Raster tiles carry an
+    "API key required" watermark, are being retired by CARTO, and can't be
+    restyled; vector is sharper at every zoom and follows the app's theme.
+    A CARTO key is optional today; see styleUrl() to add one.
+
+  DATA FLOW (the whole app in one line)
+    file -> parseGPX() -> computeDerived() -> detectWaves() -> render*()
+
+    parseGPX()       raw XML  -> [{lat, lon, time, ele}]
+    computeDerived() adds per-point speed/distance/elapsed-time, sets hasTime
+    detectWaves()    scans for runs above PLANING_THRESHOLD_KMH
+    rebuildAll()     redraws stats, run list, map track and timeline
+
+  KEY CONVENTIONS
+    - Speed is stored internally in METRES PER SECOND, always. Conversion to
+      the display unit happens only at render time via toUnit(). Don't store
+      converted values; switching units re-renders from the same m/s source.
+    - `points[i].t` is ELAPSED seconds since the first fix. `points[i].time`
+      is the real Date. The timeline shows wall-clock time derived from the
+      latter; see wallDate().
+    - "wave" in identifier names is a leftover from when this was a surfing
+      tool. It means "run" (a planing burst) everywhere. Renaming it is safe
+      but touches a lot of lines, so it was left alone.
+
+  PERFORMANCE NOTES (learned the hard way - please read before changing)
+    A typical session is 1Hz for 1-2 hours, so 5,000-10,000 points. Two things
+    fall over at that size if you're not careful:
+      1. One map layer per GPS sample. drawTrack() merges consecutive samples
+         of similar speed into single polylines instead (~70% fewer layers).
+      2. Charting libraries drawing every point with per-point styling. The
+         timeline aggregates min/max per pixel column instead, which is O(px)
+         rather than O(points) and renders a full session in ~5ms.
+
+  LAYOUT
+    The page is locked to the viewport (html/body overflow:hidden). Only the
+    run list scrolls. Nothing else moves.
+  ============================================================================
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GPSFlow — GPX &amp; SBP track viewer</title>
+<!-- Assets are loaded from ./vendor so the app works with no internet.
+     Run scripts/vendor-assets.sh once to populate that folder. If it is
+     missing, the fallback below pulls Leaflet from a CDN instead, so the
+     app still runs online in an un-vendored checkout. -->
+<link rel="stylesheet" href="vendor/maplibre-gl.css">
+<link rel="stylesheet" href="vendor/fonts.css">
+<script src="vendor/maplibre-gl.js"></script>
+<script>
+  // MapLibre is only touched once a file is loaded, so an async fallback has
+  // ample time to arrive before it is needed.
+  if (!window.maplibregl) {
+    console.warn("Vendored MapLibre missing - falling back to CDN. Run scripts/vendor-assets.sh for offline use.");
+    var lcss = document.createElement("link");
+    lcss.rel = "stylesheet";
+    lcss.href = "https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css";
+    document.head.appendChild(lcss);
+    var ljs = document.createElement("script");
+    ljs.src = "https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js";
+    document.head.appendChild(ljs);
+  }
+</script>
+<style>
+  /* ------------------------------------------------------------------
+     DESIGN TOKENS
+     Dark nautical palette. --ocean/--seafoam/--sand/--coral double as the
+     speed ramp: the same four colours are hardcoded as RGB triplets in
+     COLOR_STOPS in the script, so if you restyle here, update those too.
+     ------------------------------------------------------------------ */
+  :root{
+    /* Dark theme (default). The original ocean palette, pulled a few stops
+       darker than it started. Light theme overrides live in the block below;
+       every colour the app draws - including the <canvas> timeline - comes
+       from these variables, so the two themes stay in sync automatically. */
+    --bg: #061019;
+    --bg-deep: #030A10;
+    --panel: #0A1A23;
+    --panel-2: #10242F;
+    --line: rgba(234,243,241,0.10);
+    --line-strong: rgba(234,243,241,0.20);
+    --text: #EAF3F1;
+    --text-dim: #8FAAAC;
+    --ocean: #2E7C93;
+    --seafoam: #3FBFAD;
+    --sand: #F2B84B;
+    --coral: #E5533C;
+    --btn-hover: #57cdbc;
+    --on-accent: #04211D;      /* text sitting on a --seafoam fill */
+    --track-gap: #5b6f73;      /* dashed recording-gap segments */
+    --map-backdrop: #08161D;
+    /* Timeline canvas: JS reads these rather than hardcoding hex */
+    --grid: rgba(234,243,241,0.07);
+    --cursor-line: rgba(234,243,241,0.75);
+    --thresh-line: rgba(234,243,241,0.32);
+    --run-band: rgba(229,83,60,0.10);
+    --sel-dim: rgba(3,10,16,0.55);      /* veil over unselected time */
+    --sel-edge: #3FBFAD;                /* selection boundary lines */
+    --marker-stroke: #030A10;
+
+    /* Open Sans throughout. --font-display is kept as a separate token so
+       headings/stats can be given their own face again later without
+       touching every rule. */
+    --font-display: 'Open Sans', system-ui, -apple-system, sans-serif;
+    --font-body: 'Open Sans', system-ui, -apple-system, sans-serif;
+  }
+
+  /* Light theme. Accents are darkened versions of the same hues so they keep
+     enough contrast against pale surfaces. */
+  html[data-theme="light"]{
+    --bg: #EEF3F4;
+    --bg-deep: #E3EBEC;
+    --panel: #FFFFFF;
+    --panel-2: #F1F6F7;
+    --line: rgba(8,26,34,0.12);
+    --line-strong: rgba(8,26,34,0.22);
+    --text: #0B1E26;
+    --text-dim: #5A767D;
+    --ocean: #24697E;
+    --seafoam: #178A79;
+    --sand: #B37B0C;
+    --coral: #C43F26;
+    --btn-hover: #12766A;
+    --on-accent: #FFFFFF;
+    --track-gap: #93A7AC;
+    --map-backdrop: #DCE6E8;
+    --grid: rgba(8,26,34,0.09);
+    --cursor-line: rgba(8,26,34,0.70);
+    --thresh-line: rgba(8,26,34,0.35);
+    --run-band: rgba(196,63,38,0.10);
+    --sel-dim: rgba(238,243,244,0.62);
+    --sel-edge: #178A79;
+    --marker-stroke: #FFFFFF;
+  }
+
+  /* The page never scrolls. The app is exactly one viewport tall and the
+     run list is the only scrollable region inside it. */
+  *{ box-sizing: border-box; }
+  html,body{ height:100%; overflow:hidden; }
+  body{
+    margin:0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-body);
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection{ background: var(--seafoam); color: var(--on-accent); }
+
+  .app{ height:100vh; display:flex; flex-direction:column; overflow:hidden; }
+
+  /* ---------- Header ---------- */
+  header{
+    position: relative;
+    padding: 18px 28px 16px 18px;
+    border-bottom: 1px solid var(--line);
+    background: var(--bg);   /* flat - same colour as the rest of the app */
+    flex-shrink:0;
+  }
+  /* Only the icon controls live here now; the stats sit further left. */
+  .header-right{
+    display:flex;
+    align-items:center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  /* Pushed up against the wordmark, with the icons taking the far right. */
+  .session-meta{ margin-left: 34px; margin-right: auto; }
+  /* Square icon button, sized to sit level with the theme toggle. */
+  .icon-btn{
+    background: transparent;
+    border: 1px solid var(--line-strong);
+    color: var(--text-dim);
+    border-radius: 6px;
+    width: 31px;
+    height: 31px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    padding: 0;
+  }
+  .icon-btn:hover{ background: var(--panel-2); color: var(--text); }
+  .icon-btn[aria-expanded="true"]{ background: var(--panel-2); color: var(--text); border-color: var(--seafoam); }
+
+  .theme-toggle{
+    background: transparent;
+    border: 1px solid var(--line-strong);
+    color: var(--text-dim);
+    border-radius: 6px;
+    padding: 6px 11px;
+    font-size: 12.5px;
+    font-family: var(--font-body);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+  }
+  .theme-toggle:hover{ background: var(--panel-2); color: var(--text); }
+
+  .header-row{
+    position:relative;
+    display:flex;
+    align-items:flex-end;
+    justify-content:space-between;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+  /* Logo lockup: the mark stands beside the title AND tagline together, so
+     it can be tall without unbalancing the row. Saturation and opacity are
+     pulled back slightly so a hand-drawn illustration sits quietly next to
+     the type instead of shouting over it. */
+  .brand{
+    display:flex;
+    align-items:center;
+    gap: 12px;
+  }
+  .brand-mark{
+    height: 52px;
+    width: auto;
+    display:block;
+    opacity: 0.92;
+    filter: saturate(0.8);
+    flex-shrink:0;
+    margin-left: -4px;   /* optical alignment: art has more visual air than the type */
+  }
+  html[data-theme="light"] .brand-mark{ opacity: 0.95; filter: saturate(0.85); }
+  .brand-text{ min-width:0; }
+
+  .brand h1{
+    font-family: var(--font-display);
+    font-weight:700;
+    font-size: 27px;
+    margin:0;
+    letter-spacing: -0.3px;
+  }
+  .brand p{
+    margin: 4px 0 0;
+    color: var(--text-dim);
+    font-size: 13.5px;
+  }
+  .session-meta{
+    display:flex;
+    gap: 22px;
+    flex-wrap: wrap;
+  }
+  .session-meta .stat{ min-width: 78px; }
+  .session-meta .stat .num{
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 22px;
+    letter-spacing: -0.2px;
+    font-variant-numeric: tabular-nums;
+    line-height:1;
+  }
+  .session-meta .stat .lbl{
+    display:block;
+    color: var(--text-dim);
+    font-size: 11.5px;
+    margin-top: 4px;
+  }
+  /* All four stats share the plain text colour - no per-stat tinting. */
+  .session-meta .stat .num{ color: var(--text); }
+
+  /* ---------- Display menu ----------
+     The settings that used to occupy a full toolbar row now sit behind an
+     eye icon in the header, which buys the map and the results list the
+     whole height that bar was taking. */
+  .menu-wrap{ position: relative; }
+  .menu-btn[aria-expanded="true"]{ background: var(--panel-2); }
+  .menu-panel{
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    z-index: 900;
+    min-width: 240px;
+    padding: 12px;
+    background: var(--panel-2);
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    box-shadow: 0 12px 30px rgba(0,0,0,0.45);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .menu-row{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap: 14px;
+  }
+  .menu-row label{ color: var(--text-dim); font-size: 12.5px; }
+  .seg{
+    display:inline-flex;
+    border: 1px solid var(--line-strong);
+    border-radius: 6px;
+    overflow:hidden;
+  }
+  .seg button{
+    background: transparent;
+    color: var(--text-dim);
+    border:none;
+    padding: 6px 12px;
+    font-size: 13px;
+    font-family: var(--font-body);
+    cursor:pointer;
+    border-right: 1px solid var(--line-strong);
+  }
+  .seg button:last-child{ border-right:none; }
+  .seg button.active{ background: var(--ocean); color:#fff; }
+  .seg button:hover:not(.active){ background: var(--panel-2); color: var(--text); }
+
+  button.ghost{
+    background: transparent;
+    border: 1px solid var(--line-strong);
+    color: var(--text);
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 13px;
+    cursor:pointer;
+    font-family: var(--font-body);
+  }
+  button.ghost:hover{ background: var(--panel-2); }
+
+
+  /* ---------- Empty state ---------- */
+  .empty-wrap{
+    flex:1;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    padding: 40px 20px;
+  }
+  .dropzone{
+    width: min(560px, 100%);
+    border: 1.5px dashed var(--line-strong);
+    border-radius: 10px;
+    padding: 44px 32px;
+    text-align:center;
+    background: var(--panel);
+    transition: border-color .15s, background .15s;
+  }
+  .dropzone.drag{ border-color: var(--seafoam); background: var(--panel-2); }
+  .dropzone h2{
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 20px;
+    margin: 0 0 6px;
+  }
+  .dropzone p{ color: var(--text-dim); font-size: 13.5px; margin: 0 0 22px; }
+  .dropzone .actions{ display:flex; gap:10px; justify-content:center; flex-wrap:wrap; }
+  .btn-primary{
+    background: var(--seafoam);
+    color: var(--on-accent);
+    border:none;
+    padding: 10px 18px;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor:pointer;
+    font-family: var(--font-body);
+  }
+  .btn-primary:hover{ background:var(--btn-hover); }
+  .btn-secondary{
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--line-strong);
+    padding: 10px 18px;
+    border-radius: 6px;
+    font-size: 14px;
+    cursor:pointer;
+    font-family: var(--font-body);
+  }
+  .btn-secondary:hover{ background: var(--panel-2); }
+  .error-msg{
+    margin-top: 16px;
+    color: var(--coral);
+    font-size: 13px;
+  }
+  #fileInput{ display:none; }
+
+  /* ---------- Main dashboard ----------
+     .dash is the flexible middle row (map + sidebar); the timeline below it
+     is fixed height. min-height:0 is required or the flex children refuse to
+     shrink and push the timeline off-screen. */
+  .dash{ flex:1; display:flex; min-height:0; }
+  .map-col{ flex: 1 1 62%; position: relative; min-width: 0; }
+  #map{ position:absolute; inset:0; background: var(--map-backdrop); }
+  /* Attribution must stay visible (CARTO/OpenStreetMap terms), but it can
+     be quiet about it. */
+  .maplibregl-ctrl-attrib{ font-size: 10px; }
+
+  /* Credit riding alongside the wordmark. Small and dim enough to read as a
+     mark rather than as part of the title. Baseline-aligned to the cap
+     height rather than sitting on the wordmark's own baseline. */
+  .copyright{
+    font-size: 8px;
+    font-weight: 400;
+    letter-spacing: 0.02em;
+    color: var(--text-dim);
+    opacity: 0.55;
+    margin-left: 6px;
+    vertical-align: 5px;
+    white-space: nowrap;
+    user-select: none;
+  }
+  .maplibregl-ctrl-attrib-inner{ opacity: 0.85; }
+
+  .side-col{
+    flex: 1 1 38%;
+    max-width: 380px;
+    border-left: 1px solid var(--line);
+    background: var(--bg);
+    display:flex;
+    flex-direction:column;
+    min-height:0;
+    gap: 10px;
+    padding: 10px;
+  }
+  /* Two visually distinct boxes: the category picker, and the results for
+     whichever category is picked. They do different jobs, so they read as
+     separate cards rather than one continuous list. */
+  .side-box{
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    /* Sit at natural height and never give ground. Without this the category
+       box shrinks as the results list grows, squashing its six rows. */
+    flex: 0 0 auto;
+  }
+  /* The results box is the one that absorbs the leftover space, and its list
+     scrolls inside it. min-height:0 is what lets a flex child actually be
+     shorter than its content instead of forcing the column taller. */
+  .side-box.results-box{
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+  .side-col h3{
+    font-family: var(--font-display);
+    font-weight:600;
+    font-size: 14px;
+    letter-spacing: 0.02em;
+    margin: 0;
+    padding: 16px 18px 10px;
+    color: var(--text);
+    border-bottom: 1px solid var(--line);
+  }
+  /* Category picker. Laid out as a grid of chips rather than list rows: the
+     job here is choosing, and chips read as controls where flat rows read as
+     information. */
+  .best-panel{
+    flex-shrink:0;
+    display:grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    padding: 10px 12px 12px;
+  }
+  .best-chip{
+    display:flex;
+    flex-direction:column;
+    gap: 3px;
+    padding: 8px 10px;
+    background: var(--panel-2);
+    border: 1px solid var(--line-strong);
+    border-radius: 7px;
+    cursor: pointer;
+    transition: border-color .12s ease, transform .12s ease, background .12s ease;
+  }
+  .best-chip:hover{
+    border-color: var(--seafoam);
+    transform: translateY(-1px);
+  }
+  .best-chip:active{ transform: translateY(0); }
+  .best-chip.active{
+    border-color: var(--seafoam);
+    background: var(--panel-2);
+    box-shadow: inset 0 0 0 1px var(--seafoam);
+  }
+  .best-chip .cat{
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-dim);
+  }
+  .best-chip.active .cat{ color: var(--seafoam); }
+  .best-chip .val{
+    font-size: 14px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+    line-height:1.1;
+  }
+  .best-chip .val small{ font-weight:400; color: var(--text-dim); font-size: 10.5px; margin-left:2px; }
+  .best-empty{ padding: 12px 18px; font-size:12px; color: var(--text-dim); grid-column: 1 / -1; }
+
+  /* A hint under the heading, since the chips are the main control here. */
+  .side-box h3 .sub-hint{
+    display:block;
+    font-family: var(--font-body);
+    font-weight: 400;
+    font-size: 11px;
+    color: var(--text-dim);
+    letter-spacing: 0;
+    margin-top: 2px;
+  }
+
+  .wave-list{
+    overflow-y:auto;
+    flex:1;
+    min-height:0;
+    scrollbar-width: thin;
+    scrollbar-color: var(--line-strong) transparent;
+  }
+  .wave-list::-webkit-scrollbar{ width: 8px; }
+  .wave-list::-webkit-scrollbar-track{ background: transparent; }
+  .wave-list::-webkit-scrollbar-thumb{ background: var(--line-strong); border-radius: 4px; }
+  .wave-list::-webkit-scrollbar-thumb:hover{ background: var(--ocean); }
+  .wave-item{
+    position: relative;
+    display:flex;
+    align-items:center;
+    gap: 11px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--line);
+    cursor:pointer;
+    overflow: hidden;
+  }
+  /* Speed bar behind each row, scaled against the best result in the list.
+     Width is set from JS (element.style), not a markup style attribute,
+     because a nonce-bearing CSP drops those - see the utilities note. */
+  .wave-item::before{
+    content:"";
+    position:absolute;
+    left:0; top:0; bottom:0;
+    width: var(--bar, 0%);
+    background: linear-gradient(90deg, rgba(229,83,60,0.22), rgba(229,83,60,0.02));
+    pointer-events:none;
+  }
+  .wave-item > *{ position: relative; }
+  .wave-item:hover{ background: var(--panel-2); }
+  .wave-item.pulse{ background: var(--panel-2); box-shadow: inset 3px 0 0 var(--coral); }
+  .wave-item:hover .wave-go{ opacity: 1; transform: translateX(0); }
+  .wave-rank{
+    font-family: var(--font-body);
+    font-weight: 700;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-dim);
+    width: 20px; height: 20px;
+    flex-shrink:0;
+    display:flex; align-items:center; justify-content:center;
+    border: 1px solid var(--line-strong);
+    border-radius: 50%;
+  }
+  .wave-item.pulse .wave-rank{ border-color: var(--coral); color: var(--coral); }
+  /* A chevron that slides in on hover, so rows read as navigable. */
+  .wave-go{
+    margin-left:auto;
+    color: var(--text-dim);
+    font-size: 14px;
+    opacity: 0;
+    transform: translateX(-4px);
+    transition: opacity .12s ease, transform .12s ease;
+    flex-shrink:0;
+  }
+  .wave-info{ flex:1; min-width:0; }
+  .wave-info .top{ font-size: 13.5px; }
+  .wave-info .top b{ font-variant-numeric: tabular-nums; color: var(--coral); }
+  .wave-info .sub{ font-size: 11.5px; color: var(--text-dim); margin-top:2px; }
+  .no-waves{ padding: 18px; color: var(--text-dim); font-size: 13px; line-height:1.6; }
+
+  /* ---------- Timeline ----------
+     Fixed-height bottom strip. The canvas is absolutely positioned inside
+     .tl-canvas-wrap so it can size itself from the flex layout rather than
+     needing explicit pixel dimensions. */
+  .timeline{
+    flex-shrink:0;
+    height: 172px;
+    border-top: 1px solid var(--line);
+    background: var(--panel);
+    padding: 10px 18px 8px;
+    display:flex;
+    flex-direction:column;
+    outline:none;
+  }
+  .timeline:focus-within{ box-shadow: inset 0 1px 0 var(--seafoam); }
+  .tl-head{
+    display:flex; align-items:baseline; gap:14px; margin-bottom:6px; flex-wrap:wrap;
+  }
+  .tl-head h3{
+    font-family: var(--font-display); font-weight:600; font-size:13.5px; letter-spacing:0.02em; margin:0;
+  }
+  .tl-unit{
+    font-size: 11px;
+    color: var(--text-dim);
+    border: 1px solid var(--line-strong);
+    border-radius: 4px;
+    padding: 2px 7px;
+    white-space: nowrap;
+  }
+  .tl-readout{
+    font-size: 12.5px;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-dim);
+  }
+  .tl-readout b{ color: var(--coral); }
+  .tl-readout .t{ color: var(--text); }
+  .tl-hint{ margin-left:auto; font-size: 11px; color: var(--text-dim); }
+
+  /* Selection chip: summary of the chosen time range, with a clear button. */
+  .tl-sel{
+    display:none;
+    align-items:center;
+    gap: 8px;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+    background: var(--panel-2);
+    border: 1px solid var(--line-strong);
+    border-radius: 5px;
+    padding: 3px 6px 3px 9px;
+  }
+  .tl-sel.on{ display:inline-flex; }
+  .tl-sel .sel-clear{
+    border:none;
+    background: transparent;
+    color: var(--text-dim);
+    cursor:pointer;
+    font-size: 14px;
+    line-height:1;
+    padding: 0 2px;
+    font-family: var(--font-body);
+  }
+  .tl-sel .sel-clear:hover{ color: var(--coral); }
+  .tl-zoom{ display:inline-flex; gap:4px; margin-left:10px; }
+  .tl-zoom button{
+    background: transparent;
+    border: 1px solid var(--line-strong);
+    color: var(--text-dim);
+    width: 22px; height: 22px;
+    border-radius: 4px;
+    font-size: 13px; line-height:1;
+    cursor:pointer;
+    font-family: var(--font-body);
+  }
+  .tl-zoom button:hover{ background: var(--panel-2); color: var(--text); }
+  .tl-canvas-wrap{ flex:1; position:relative; min-height:0; }
+  #timelineCanvas{
+    position:absolute; inset:0;
+    width:100%; height:100%;
+    cursor: crosshair;
+    display:block;
+  }
+
+  @media (max-width: 860px){
+    .dash{ flex-direction: column; }
+    .map-col{ height: 42vh; flex: none; }
+    .side-col{ max-width:none; border-left:none; border-top:1px solid var(--line); }
+    .session-meta{ gap:16px; }
+    .timeline{ height: 150px; }
+    .tl-hint{ display:none; }
+  }
+
+  /* Run pins and endpoint dots are drawn by MapLibre as circle layers now,
+     so they move with the map instead of being repositioned per frame by
+     JavaScript. Their sizes and colours live in ensureMapLayers(). */
+
+  /* ---------- Utilities ----------
+     These MUST stay at the end of the stylesheet. .is-hidden competes with
+     rules like .dash{display:flex} at equal specificity, so source order is
+     what decides the winner - defined earlier, it silently loses and nothing
+     hides. Deliberately not !important: the app shows panels by setting
+     element.style.display from JS, and an inline style must be able to win.
+
+     These exist instead of inline style="..." attributes because a CSP with
+     a nonce (which Tauri adds in production builds) makes browsers ignore
+     'unsafe-inline', silently dropping style attributes in the markup. */
+  .is-hidden{ display:none; }
+  .push-right{ margin-left:auto; }
+  .full-width-btn{ width:100%; margin-top:6px; }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <header>
+    <div class="header-row">
+      <div class="brand">
+        <img class="brand-mark" alt="" src="data:image/png;base64,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">
+        <div class="brand-text">
+          <h1>GPSFlow<span class="copyright">&copy; Florian Hallbauer</span></h1>
+          <p id="tagline">Your GPS Tracker</p>
+        </div>
+      </div>
+      <!-- Stats sit next to the wordmark; only the two icon controls are
+           pushed to the far right. -->
+      <div class="session-meta is-hidden" id="sessionMeta">
+        <div class="stat"><span class="num" id="mDist">–</span><span class="lbl">distance</span></div>
+        <div class="stat"><span class="num" id="mDuration">–</span><span class="lbl">duration</span></div>
+        <div class="stat"><span class="num" id="mMaxSpeed">–</span><span class="lbl">top speed</span></div>
+        <div class="stat"><span class="num" id="mWaves">–</span><span class="lbl">runs</span></div>
+      </div>
+      <div class="header-right">
+        <!-- Loading a track is an action, not a display setting, so it gets
+             its own control rather than hiding inside the menu. -->
+        <button class="icon-btn" id="newFileBtn" type="button" title="Load a different track">
+          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+            <path d="M12 16V4M12 4 7.5 8.5M12 4l4.5 4.5"
+                  fill="none" stroke="currentColor" stroke-width="1.8"
+                  stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M4 15v3.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V15"
+                  fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <div class="menu-wrap">
+          <button class="icon-btn" id="displayBtn" type="button"
+                  title="Display settings" aria-expanded="false" aria-haspopup="true">
+            <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+              <path d="M1.5 12S5 5.5 12 5.5 22.5 12 22.5 12 19 18.5 12 18.5 1.5 12 1.5 12Z"
+                    fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+              <circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="1.8"/>
+            </svg>
+          </button>
+          <div class="menu-panel is-hidden" id="displayMenu">
+            <div class="menu-row">
+              <label>Units</label>
+              <div class="seg" id="unitSeg">
+                <button data-unit="knots" class="active">kn</button>
+                <button data-unit="kmh">km/h</button>
+                <button data-unit="mph">mph</button>
+              </div>
+            </div>
+            <div class="menu-row">
+              <label>Map</label>
+              <div class="seg" id="basemapSeg">
+                <button data-basemap="light" class="active">Light</button>
+                <button data-basemap="dark">Dark</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <button class="theme-toggle" id="themeToggle" type="button"
+                title="Switch between light and dark" aria-pressed="false">
+          <span id="themeIcon">☾</span><span id="themeLabel">Dark</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <div class="empty-wrap" id="emptyWrap">
+    <div class="dropzone" id="dropzone">
+      <h2>Drop a GPX or SBP track here</h2>
+      <div class="actions">
+        <button class="btn-primary" id="chooseFileBtn">Choose a file</button>
+      </div>
+      <input type="file" id="fileInput" accept=".gpx,.sbp,application/gpx+xml,text/xml,application/xml">
+      <div class="error-msg is-hidden" id="errorMsg"></div>
+    </div>
+  </div>
+
+  <!-- Dashboard: map on the left, run leaderboard on the right.
+       Hidden until a file loads; loadPoints() flips it to display:flex. -->
+  <div class="dash is-hidden" id="dash">
+    <div class="map-col"><div id="map"></div></div>
+    <div class="side-col">
+      <!-- Box 1: pick a category. Each row shows that category's best result,
+           and selecting one drives the result list below. -->
+      <section class="side-box">
+        <h3>Category<span class="sub-hint">pick one to rank the session</span></h3>
+        <div class="best-panel" id="bestPanel"></div>
+      </section>
+
+      <!-- Box 2: the ranked results for whichever category is selected. -->
+      <section class="side-box results-box">
+        <h3 id="resultsTitle">Results</h3>
+        <div class="wave-list" id="waveList"></div>
+      </section>
+    </div>
+  </div>
+
+  <!-- Timeline strip. tabindex makes it focusable so the focus ring lands
+       somewhere sensible, though key handling is bound at window level so
+       arrows work without clicking in first. Stays hidden for GPX files with
+       no timestamps, where speed can't be derived. -->
+  <div class="timeline is-hidden" id="timeline">
+    <div class="tl-head">
+      <h3>Session timeline</h3>
+      <span class="tl-unit" id="tlUnit"></span>
+      <span class="tl-readout" id="tlReadout"></span>
+      <span class="tl-sel" id="tlSel">
+        <span id="tlSelText"></span>
+        <button class="sel-clear" id="tlSelClear" title="Clear selection (Esc)">&times;</button>
+      </span>
+      <span class="tl-zoom">
+        <button id="tlZoomOut" title="Zoom out (−)">&minus;</button>
+        <button id="tlZoomIn" title="Zoom in (+)">+</button>
+      </span>
+      <span class="tl-hint">← → move &middot; shift = faster &middot; +/− zoom &middot; ctrl+drag = select &middot; click track to jump &middot; esc clears</span>
+    </div>
+    <div class="tl-canvas-wrap">
+      <canvas id="timelineCanvas"></canvas>
+    </div>
+  </div>
+
+</div>
+
+<script>
+(function(){
+  "use strict";
+
+  // ============================================================
+  // STATE
+  // Module-level singletons. There is only ever one session loaded,
+  // so this is deliberately flat rather than an app object.
+  // ============================================================
+
+  /** Every track point, in file order. Enriched by computeDerived().
+   *  @type {Array<{lat:number, lon:number, ele:?number, time:?Date,
+   *                speed:number,   // m/s over the segment ENDING at this point
+   *                dist:number,    // metres from previous point
+   *                dt:number,      // seconds from previous point
+   *                t:number,       // elapsed seconds since points[0]
+   *                validSeg:boolean}>} */
+  let points = [];
+
+  /** Detected runs, sorted fastest-first (NOT chronological - index 0 is the
+   *  fastest run of the session, which is what the sidebar ranks by).
+   *  @type {Array<{startIdx:number, endIdx:number, peakIdx:number,
+   *                maxSpeed:number, dur:number, dist:number,
+   *                peakLat:number, peakLon:number,
+   *                startT:number, endT:number}>} */
+  let waves = [];
+
+  /** False when the GPX has no <time> elements. Everything speed-related is
+   *  then meaningless, so the timeline hides and the map shows route only. */
+  let hasTime = true;
+
+  /** Current display unit key into UNIT_FACTOR/UNIT_LABEL/DIST_LABEL. */
+  let unit = "knots";
+
+  /** Speed a segment must exceed to count as planing. Was a user-facing
+   *  slider once; fixed now because 18 km/h separates planing from schlogging
+   *  reliably enough that the dial wasn't earning its screen space. */
+  const PLANING_THRESHOLD_KMH = 18;
+
+  // MapLibre handles. The track lives in a single GeoJSON source ("track");
+  // run pins, endpoints and the cursor dot are HTML markers.
+  let map;
+
+  /** The chosen time window, in elapsed seconds, or null for none.
+   *  Set by clicking a run (which selects that run's extent) or by
+   *  ctrl-dragging across the timeline. Drives the map highlight, the
+   *  timeline shading and the summary chip. */
+  let selection = null;   // {startT, endT}
+
+  /** Best result per category, as returned by computeBests(). */
+  let bests = [];
+
+  /** Which category the results box is currently listing. */
+  let selectedCategory = "peak";
+
+  /** The rows currently shown in the results box, so clicks can resolve
+   *  back to the stretch they came from. */
+  let currentResults = [];
+
+  // --- Timeline view state ---
+  // The timeline is a window onto the session: [tlViewStart, +tlViewSpan]
+  // in elapsed seconds. Zooming changes the span, scrubbing moves the cursor
+  // and drags the window along when the cursor nears an edge.
+  let tlViewStart = 0;      // elapsed seconds at the left edge of the plot
+  let tlViewSpan = 0;       // seconds visible across the plot width
+  let tlCursorIdx = 0;      // index into `points` of the scrub cursor
+  let tlRafPending = false; // set while a redraw is queued, to coalesce redraws
+
+  // Range-selection drag (ctrl/cmd + drag). Declared up here with the rest of
+  // the timeline state because drawTimeline() reads them, and it must never
+  // reach them before their declaration has run.
+  let tlSelecting = false, tlSelAnchor = 0, tlSelCurrent = 0;
+
+  /** 97th-percentile speed, used as the top of the colour ramp. A percentile
+   *  rather than the true max so one GPS glitch doesn't wash out the palette. */
+  let maxSpeedRef = 1;
+
+  /** True when the loaded file supplies its own speed measurements, so the
+   *  app is using those rather than differencing positions. Set by
+   *  computeDerived and read by the distance categories. */
+  let deviceSpeedInUse = false;
+
+  /** Which point range the map view was last fitted to, as "from:to".
+   *  Refitting only when this changes means redraws that don't alter what is
+   *  shown - theme toggle, unit switch - leave your pan and zoom alone. */
+  let lastFitKey = null;
+
+
+
+  const UNIT_FACTOR = { knots: 1.943844, kmh: 3.6, mph: 2.236936 };
+  const UNIT_LABEL  = { knots: "kn", kmh: "km/h", mph: "mph" };
+  const DIST_LABEL  = { knots: "nm", kmh: "km", mph: "mi" };
+
+  // ============================================================
+  // UTILITIES
+  // ============================================================
+
+  /** Great-circle distance between two WGS84 coords, in metres.
+   *  Plenty accurate at the scales involved (metres apart, 1Hz sampling). */
+  function haversine(lat1, lon1, lat2, lon2){
+    const R = 6371000;
+    const toRad = d => d * Math.PI / 180;
+    const dLat = toRad(lat2-lat1), dLon = toRad(lon2-lon1);
+    const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  }
+
+  /** Human duration: "1h 41m" or "3m 20s". Used for the session-length stat,
+   *  NOT for the timeline (which shows wall-clock time - see fmtWall). */
+  function fmtDuration(sec){
+    sec = Math.round(sec);
+    const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), s = sec%60;
+    if (h>0) return h+"h "+String(m).padStart(2,"0")+"m";
+    return m+"m "+String(s).padStart(2,"0")+"s";
+  }
+
+  /** m/s -> current display unit. The single conversion chokepoint: internal
+   *  maths stays in m/s so unit switching never loses precision. */
+  function toUnit(speedMs){ return speedMs * UNIT_FACTOR[unit]; }
+
+  /** Metres -> the distance unit that pairs with the current speed unit
+   *  (knots->nautical miles, mph->statute miles, km/h->kilometres). */
+  function toDistUnit(meters){
+    if (unit==="knots") return meters/1852;
+    if (unit==="mph") return meters/1609.344;
+    return meters/1000;
+  }
+
+  /** Resolve a CSS custom property to its current value.
+   *  Canvas and Leaflet both need literal colour strings, so anything drawn
+   *  outside CSS has to look its colour up this way - that is what lets the
+   *  map and timeline follow the light/dark theme. */
+  function themeColor(name){
+    return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  }
+
+  /** Speed colour ramp: deep ocean blue -> seafoam -> sand -> coral.
+   *  `t` is the normalised position of each stop along the ramp. */
+  const COLOR_STOPS = [
+    {t:0.00, rgb:[27,75,90]},     // deep ocean - slowest
+    {t:0.40, rgb:[63,191,173]},   // seafoam
+    {t:0.70, rgb:[242,184,75]},   // sand
+    {t:1.00, rgb:[229,83,60]}     // coral - fastest
+  ];
+  /** Interpolates COLOR_STOPS for a given speed, normalised against
+   *  maxSpeedRef. Shared by the map track, the timeline and the cursor dot so
+   *  a colour means the same thing everywhere. */
+  function colorForSpeed(speedMs){
+    let t = maxSpeedRef > 0 ? speedMs / maxSpeedRef : 0;
+    t = Math.max(0, Math.min(1, t));
+    let a = COLOR_STOPS[0], b = COLOR_STOPS[COLOR_STOPS.length-1];
+    for (let i=0;i<COLOR_STOPS.length-1;i++){
+      if (t >= COLOR_STOPS[i].t && t <= COLOR_STOPS[i+1].t){ a = COLOR_STOPS[i]; b = COLOR_STOPS[i+1]; break; }
+    }
+    const span = (b.t - a.t) || 1;
+    const lt = (t - a.t) / span;
+    const r = Math.round(a.rgb[0] + (b.rgb[0]-a.rgb[0])*lt);
+    const g = Math.round(a.rgb[1] + (b.rgb[1]-a.rgb[1])*lt);
+    const bl = Math.round(a.rgb[2] + (b.rgb[2]-a.rgb[2])*lt);
+    return `rgb(${r},${g},${bl})`;
+  }
+
+  /** Nearest-rank percentile. Small arrays, called rarely - the sort is fine. */
+  function percentile(arr, p){
+    if (!arr.length) return 0;
+    const s = [...arr].sort((x,y)=>x-y);
+    const idx = Math.min(s.length-1, Math.floor(p*s.length));
+    return s[idx];
+  }
+
+  // ============================================================
+  // GPX PARSING
+  // ============================================================
+
+  /** Parse GPX text into bare track points.
+   *
+   *  Deliberately tolerant: falls back to <rtept> if there are no <trkpt>,
+   *  and drops points with unparseable coordinates rather than throwing.
+   *  Devices vary a lot here - some write <speed> and <course> per point
+   *  (we ignore those and derive speed ourselves, so every file is treated
+   *  identically), some omit <ele>, some omit <time> entirely.
+   *
+   *  @param {string} xmlText raw file contents
+   *  @returns {Array<{lat,lon,time,ele}>}
+   *  @throws if the XML is malformed or contains no usable points
+   */
+  function parseGPX(xmlText){
+    const doc = new DOMParser().parseFromString(xmlText, "application/xml");
+    if (doc.querySelector("parsererror")) throw new Error("This file doesn't look like valid GPX/XML.");
+    let pts = Array.from(doc.getElementsByTagName("trkpt"));
+    if (pts.length === 0) pts = Array.from(doc.getElementsByTagName("rtept"));
+    if (pts.length === 0) throw new Error("No track points found in this file.");
+    return pts.map(pt => {
+      const lat = parseFloat(pt.getAttribute("lat"));
+      const lon = parseFloat(pt.getAttribute("lon"));
+      const timeEl = pt.getElementsByTagName("time")[0];
+      const eleEl = pt.getElementsByTagName("ele")[0];
+
+      // Many speed-oriented trackers write a <speed> element: the receiver's
+      // own Doppler measurement, in metres per second. Where it exists it
+      // beats differencing positions, which measures the straight line
+      // between fixes and inherits the error in both of them. On a real
+      // session the two disagree by about 0.6 km/h at peak, with position
+      // maths reading low. Files without it fall back to derived speed.
+      const speedEl = pt.getElementsByTagName("speed")[0];
+      const devSpeed = speedEl ? parseFloat(speedEl.textContent) : NaN;
+
+      return {
+        lat, lon,
+        deviceSpeed: Number.isFinite(devSpeed) && devSpeed >= 0 ? devSpeed : undefined,
+        time: timeEl ? new Date(timeEl.textContent) : null,
+        ele: eleEl ? parseFloat(eleEl.textContent) : null
+      };
+    }).filter(p => Number.isFinite(p.lat) && Number.isFinite(p.lon));
+  }
+
+  /** Parse a Locosys .sbp log (GT-11, GT-31, GW-52, GW-60).
+   *
+   *  Layout per the SiRF Binary (Packed) documentation at
+   *  logiqx.github.io/gps-wizard/formats/sbp.html - "Geodetic Navigation
+   *  Data, Message ID 41", 32 bytes per record, all little-endian:
+   *
+   *      +0   uint8   HDOP, resolution 0.2
+   *      +1   uint8   number of satellites in fix
+   *      +2   uint16  UTC milliseconds
+   *      +4   uint32  UTC packed datetime (see below)
+   *      +8   uint32  satellite ID list
+   *      +12  int32   latitude,  1e-7 degrees
+   *      +16  int32   longitude, 1e-7 degrees
+   *      +20  int32   altitude above MSL, cm
+   *      +24  uint16  speed over ground, cm/s
+   *      +26  uint16  course over ground, 0.01 degrees
+   *      +28  int16   climb rate, cm/s
+   *      +30  uint8   speed dilution of precision, 0.01 m/s
+   *      +31  uint8   vertical SDOP, 0.01 m/s
+   *
+   *  The file is preceded by a 64-byte header carrying a SiRF frame with an
+   *  ASCII device string, e.g. "BHaacke,168600967,2,V1.2A0314B,2.0h,00".
+   *
+   *  PACKED DATETIME. A full UTC timestamp squeezed into 32 bits:
+   *
+   *      bits  0-5    seconds
+   *      bits  6-11   minutes
+   *      bits 12-16   hours
+   *      bits 17-21   day of month
+   *      bits 22-31   months since January 2000
+   *
+   *  The month field counts months rather than storing year and month
+   *  separately, so December leaves a remainder of zero and belongs to the
+   *  previous year - handled below.
+   *
+   *  SPEED. The device's own Doppler measurement is used rather than
+   *  differencing positions: at 5 Hz, position noise produces spikes of 50+
+   *  knots where the receiver correctly reports single figures.
+   *
+   *  @param {ArrayBuffer} buffer raw file bytes
+   *  @returns {Array<{lat,lon,ele,time,deviceSpeed}>}
+   */
+  function parseSBP(buffer){
+    const dv = new DataView(buffer);
+    const HEADER_BYTES = 0x40, REC = 32;
+    if (dv.byteLength < HEADER_BYTES + REC){
+      throw new Error("This .sbp file is too short to contain any track data.");
+    }
+
+    const pts = [];
+    for (let off = HEADER_BYTES; off + REC <= dv.byteLength; off += REC){
+      const lat = dv.getInt32(off + 12, true) / 1e7;
+      const lon = dv.getInt32(off + 16, true) / 1e7;
+      // Skip records without a usable fix rather than letting them drag the
+      // track off to null island.
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+      if (lat < -90 || lat > 90 || lon < -180 || lon > 180) continue;
+      if (lat === 0 && lon === 0) continue;
+
+      const packed = dv.getUint32(off + 4, true);
+      const sec   =  packed        & 0x3F;
+      const mins  = (packed >>> 6) & 0x3F;
+      const hour  = (packed >>> 12) & 0x1F;
+      const day   = (packed >>> 17) & 0x1F;
+      const months = packed >>> 22;
+      let year  = 2000 + Math.floor(months / 12);
+      let month = months % 12;
+      if (month === 0){ month = 12; year -= 1; }
+
+      // Sub-second precision comes from the millisecond field; its whole
+      // seconds duplicate what the packed value already gives.
+      const subMs = dv.getUint16(off + 2, true) % 1000;
+
+      const t = Date.UTC(year, month - 1, day, hour, mins, sec, subMs);
+      if (!Number.isFinite(t)) continue;
+
+      pts.push({
+        lat, lon,
+        ele: dv.getInt32(off + 20, true) / 100,
+        time: new Date(t),
+        deviceSpeed: dv.getUint16(off + 24, true) / 100
+      });
+    }
+
+    if (pts.length < 2) throw new Error("No usable track points found in this .sbp file.");
+    return pts;
+  }
+
+  /** Annotate points in place with distance  /** Annotate points in place with distance, delta-time, speed and elapsed
+   *  time, and set the module-level `hasTime` flag.
+   *
+   *  Speed is derived from consecutive positions rather than read from any
+   *  <speed> element, so all devices are handled the same way.
+   *
+   *  The `validSeg` flag marks segments safe to compute speed from. A segment
+   *  is invalid when dt <= 0 (duplicate or out-of-order timestamps) or
+   *  dt > 30s (a recording gap - the tracker lost signal or was paused).
+   *  Dividing a large distance by a large dt across a gap would invent a
+   *  plausible-looking but fictional speed, so those segments are excluded
+   *  from stats and drawn as a dashed line on the map instead.
+   *
+   *  @param {Array} pts from parseGPX()
+   *  @returns {Array} the same array, mutated
+   */
+  function computeDerived(pts){
+    hasTime = pts.every(p => p.time instanceof Date && !isNaN(p.time));
+    // .sbp logs carry the device's own Doppler speed, which beats
+    // differencing positions - see parseSBP for why it matters.
+    const useDeviceSpeed = pts.some(p => typeof p.deviceSpeed === "number");
+    // Remembered so the distance categories can integrate the same source
+    // instead of re-deciding from a single sample.
+    deviceSpeedInUse = useDeviceSpeed;
+    const t0 = hasTime ? pts[0].time.getTime() : 0;
+
+    pts[0].speed = useDeviceSpeed ? (pts[0].deviceSpeed || 0) : 0;
+    pts[0].dist = 0; pts[0].dt = 0; pts[0].t = 0;
+    pts[0].isGap = true; pts[0].validSeg = false;
+
+    for (let i=1;i<pts.length;i++){
+      const p0 = pts[i-1], p1 = pts[i];
+      const dist = haversine(p0.lat,p0.lon,p1.lat,p1.lon);
+      let dt = 0;
+      if (hasTime) dt = (p1.time.getTime() - p0.time.getTime())/1000;
+
+      // A gap is a break in recording: the map draws these dashed rather
+      // than pretending you travelled in a straight line at speed.
+      const isGap = !(hasTime && dt > 0 && dt <= 30);
+
+      p1.dist = dist;
+      p1.dt = dt;
+      p1.isGap = isGap;
+
+      if (useDeviceSpeed){
+        // The reading is instantaneous and stays trustworthy across a gap,
+        // so it is kept; only the interpolated line is treated as suspect.
+        p1.speed = typeof p1.deviceSpeed === "number"
+          ? p1.deviceSpeed
+          : (dt > 0 && dt <= 30 ? dist/dt : 0);   // fall back for a missing sample
+        p1.validSeg = hasTime && dt > 0;
+      } else {
+        p1.validSeg = !isGap;
+        p1.speed = p1.validSeg ? dist/dt : 0;
+      }
+
+      p1.t = hasTime ? (p1.time.getTime()-t0)/1000 : i;
+    }
+    return pts;
+  }
+
+  // ============================================================
+  // BEST RESULTS
+  // The categories speedsurfers actually compare: peak speed plus the best
+  // average over a fixed time or a fixed distance. A 2-second average is a
+  // far better measure of a session than an instantaneous maximum, which one
+  // noisy fix can inflate.
+  // ============================================================
+
+  const BEST_CATEGORIES = [
+    { key: "peak", label: "Top speed",     type: "instant" },
+    { key: "s2",   label: "2 sec",         type: "time",     amount: 2    },
+    { key: "m100", label: "100 m",         type: "distance", amount: 100  },
+    { key: "m250", label: "250 m",         type: "distance", amount: 250  },
+    { key: "m500", label: "500 m",         type: "distance", amount: 500  },
+    { key: "nm",   label: "Nautical mile", type: "distance", amount: 1852 },
+  ];
+
+  /** How many ranked results to list for a category. */
+  const RESULTS_PER_CATEGORY = 10;
+
+  /** Best average speed for each category, with the stretch that produced it.
+   *
+   *  Sliding window, one pass per category. Two details matter:
+   *
+   *  DISTANCE SOURCE. Where the device reports Doppler speed, distance is
+   *  integrated from it rather than summed from position deltas. At 5 Hz,
+   *  GPS jitter inflates path length by several percent - on a real session
+   *  here, 5.25 km by positions against 5.04 km by Doppler - which would
+   *  flatter every distance category.
+   *
+   *  GAPS. A window is never allowed to span a break in recording, since the
+   *  straight line across a gap is not distance you actually sailed.
+   *
+   *  @returns {Array} one entry per category that could be satisfied
+   */
+  function computeBests(){
+    if (!hasTime || points.length < 2) return [];
+    const n = points.length;
+    const useSpeed = deviceSpeedInUse;
+
+    const cum = new Float64Array(n);   // cumulative distance
+    const tt  = new Float64Array(n);   // elapsed time
+    tt[0] = points[0].t;
+    for (let i = 1; i < n; i++){
+      const p = points[i];
+      const step = useSpeed ? Math.max(0, p.speed) * p.dt : (p.dist || 0);
+      cum[i] = cum[i-1] + step;
+      tt[i]  = p.t;
+    }
+
+    const out = [];
+    for (const cat of BEST_CATEGORIES){
+      if (cat.type === "instant"){
+        let bi = -1, best = 0;
+        for (let i = 0; i < n; i++){
+          if (points[i].validSeg && points[i].speed > best){ best = points[i].speed; bi = i; }
+        }
+        if (bi >= 0){
+          out.push(Object.assign({}, cat, { speed: best, startIdx: bi, endIdx: bi,
+                                            startT: points[bi].t, endT: points[bi].t }));
+        }
+        continue;
+      }
+
+      const wins = categoryWindows(cat, cum, tt, 1);
+      if (wins.length) out.push(Object.assign({}, cat, wins[0]));
+    }
+    return out;
+  }
+
+  /** Ranked, non-overlapping windows for one category, best first.
+   *
+   *  One candidate window is formed per end-point, then the best are taken
+   *  greedily, skipping any that overlap one already chosen. Without the
+   *  overlap rule the "top ten" would just be ten shifted copies of the same
+   *  few seconds of sailing.
+   */
+  function categoryWindows(cat, cum, tt, limit){
+    const n = points.length;
+    const cands = [];
+    let i = 0, floor = 0;
+
+    for (let j = 1; j < n; j++){
+      if (points[j].isGap){ floor = j; i = j; continue; }
+      if (i < floor) i = floor;
+
+      const reach = (k) => cat.type === "distance" ? (cum[j] - cum[k]) : (tt[j] - tt[k]);
+      while (i + 1 <= j && reach(i + 1) >= cat.amount) i++;
+      if (i < floor || reach(i) < cat.amount) continue;
+
+      const time = tt[j] - tt[i];
+      if (time <= 0) continue;
+      cands.push({ speed: (cum[j] - cum[i]) / time, startIdx: i, endIdx: j,
+                   startT: points[i].t, endT: points[j].t });
+    }
+
+    cands.sort((a, b) => b.speed - a.speed);
+    const chosen = [];
+    for (const c of cands){
+      if (chosen.some(o => c.startIdx <= o.endIdx && c.endIdx >= o.startIdx)) continue;
+      chosen.push(c);
+      if (chosen.length >= limit) break;
+    }
+    return chosen;
+  }
+
+  /** The ranked result list for whichever category is selected.
+   *  "Top speed" is special-cased to the detected planing runs, which is the
+   *  more useful reading of "my fastest moments" than ten adjacent samples
+   *  off the same peak. */
+  function resultsForCategory(key){
+    const cat = BEST_CATEGORIES.find(c => c.key === key);
+    if (!cat || !hasTime || points.length < 2) return [];
+
+    if (cat.type === "instant"){
+      return waves.map(w => ({
+        speed: w.maxSpeed, startIdx: w.startIdx, endIdx: w.endIdx,
+        startT: w.startT, endT: w.endT, isRun: true
+      }));
+    }
+
+    const n = points.length;
+    const useSpeed = deviceSpeedInUse;
+    const cum = new Float64Array(n), tt = new Float64Array(n);
+    tt[0] = points[0].t;
+    for (let i = 1; i < n; i++){
+      const p = points[i];
+      cum[i] = cum[i-1] + (useSpeed ? Math.max(0, p.speed) * p.dt : (p.dist || 0));
+      tt[i] = p.t;
+    }
+    return categoryWindows(cat, cum, tt, RESULTS_PER_CATEGORY);
+  }
+
+  /** Find "runs": stretches where speed stays above a threshold.
+   *
+   *  A simple state machine - open a run when speed crosses the threshold,
+   *  extend it while it stays above, close it when it drops. Runs shorter
+   *  than minDurationSec are discarded so a single noisy GPS sample doesn't
+   *  register as a run.
+   *
+   *  NOTE the return order: sorted by max speed DESCENDING, not by time. The
+   *  sidebar is a leaderboard. Anything needing chronological order should
+   *  sort by startT itself.
+   *
+   *  @param {Array} pts annotated points
+   *  @param {number} thresholdMs threshold in m/s
+   *  @param {number} minDurationSec discard runs shorter than this
+   *  @returns {Array} runs, fastest first
+   */
+  function detectWaves(pts, thresholdMs, minDurationSec){
+    const runs = [];
+    let run = null;
+    for (let i=1;i<pts.length;i++){
+      const p = pts[i];
+      if (p.validSeg && p.speed >= thresholdMs){
+        if (!run) run = {startIdx:i-1, endIdx:i, dist:0, dur:0, maxSpeed:0, peakIdx:i};
+        run.endIdx = i;
+        run.dist += p.dist;
+        run.dur += p.dt;
+        if (p.speed > run.maxSpeed){ run.maxSpeed = p.speed; run.peakIdx = i; }
+      } else {
+        if (run){ runs.push(run); run = null; }
+      }
+    }
+    if (run) runs.push(run);
+    return runs.filter(r => r.dur >= minDurationSec).map(r => ({
+      ...r,
+      peakLat: pts[r.peakIdx].lat,
+      peakLon: pts[r.peakIdx].lon,
+      startT: pts[r.startIdx].t,
+      endT: pts[r.endIdx].t
+    })).sort((a,b) => b.maxSpeed - a.maxSpeed);
+  }
+
+  // ============================================================
+  // MAP RENDERING
+  // ============================================================
+
+  /** Basemap style URLs. Vector rather than raster: sharper at every zoom,
+   *  no "API key required" watermark, and the service CARTO continues to
+   *  update. */
+  const BASEMAP_STYLES = {
+    light: "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
+    dark:  "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json"
+  };
+
+  /** The basemap has its own light/dark setting, independent of the app's
+   *  theme: a dark interface around a light map is a perfectly reasonable
+   *  thing to want, and the map is the thing you actually read. */
+  let basemapMode = "light";
+
+  /** CARTO's vector basemaps need no API key today. If that changes, or you
+   *  want your usage counted against your own allowance, put a key here and
+   *  it is appended to the style URL:
+   *
+   *      const CARTO_KEY = "your-key";
+   *      return CARTO_KEY ? base + "?key=" + encodeURIComponent(CARTO_KEY) : base;
+   */
+  function styleUrl(){
+    return BASEMAP_STYLES[basemapMode === "dark" ? "dark" : "light"];
+  }
+
+  /** True once the style has loaded and it is safe to add sources/layers. */
+  let mapReady = false;
+
+  /** Set while a basemap swap is in flight, so the styledata handler knows
+   *  the difference between "the style was replaced" and ordinary tile
+   *  traffic - the latter fires the same event constantly. */
+  let styleSwapPending = false;
+
+  /** Current theme. Declared here rather than beside the toggle because
+   *  other code reads it while the map is being built. */
+  let currentTheme = "dark";
+
+  /** Create the map. Called once, lazily, on the first successful load. */
+  function initMap(){
+    map = new maplibregl.Map({
+      container: "map",
+      style: styleUrl(),
+      center: [0, 0],
+      zoom: 1,
+      attributionControl: true,
+      // The arrow keys belong to the timeline cursor, not to panning.
+      keyboard: false,
+      // Flat map: tilt and rotation only get in the way of reading a track.
+      pitchWithRotate: false,
+      dragRotate: false,
+      // A GPS track never spans the antimeridian in practice, so there is no
+      // reason to render duplicate worlds either side of it.
+      renderWorldCopies: false,
+      // No cross-fade between zoom levels: tiles appear as soon as they are
+      // ready, which reads as faster even though it is the same work.
+      fadeDuration: 0
+    });
+    map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-left");
+    map.touchZoomRotate.disableRotation();
+
+    // How far one wheel notch zooms.
+    //
+    // MapLibre turns wheel deltas into zoom at a fixed rate, but the delta a
+    // single notch reports is not the same in every engine - the desktop
+    // webview and a browser hand over different numbers, so identical code
+    // zooms noticeably less per notch in one than the other. Setting the
+    // rates explicitly makes it behave the same everywhere. Higher is
+    // faster; the library defaults are 1/450 for a wheel and 1/100 for a
+    // trackpad, and these are roughly double that.
+    map.scrollZoom.setWheelZoomRate(1 / 200);
+    map.scrollZoom.setZoomRate(1 / 60);
+
+    map.on("load", () => {
+      mapReady = true;
+      if (points.length){
+        try { drawTrack(); updateCursorMarker(); } catch (e){ console.error("First draw failed:", e); }
+      }
+    });
+
+    // A style swap drops every custom source and layer, so rebuild once the
+    // replacement has settled. styledata also fires for ordinary tile
+    // activity, so the flag keeps this from doing anything during normal
+    // panning and zooming.
+    map.on("styledata", () => {
+      if (!styleSwapPending || !mapReady || !points.length) return;
+      if (!map.getSource("track")){
+        try {
+          drawTrack();
+          updateCursorMarker();
+          styleSwapPending = false;
+        } catch (e){ /* style still settling; retried on the next event */ }
+      }
+    });
+
+    wireMapClick();
+  }
+
+  /** Point the map at a different basemap style, keeping the current view. */
+  function setBasemapStyle(){
+    if (!map) return;
+    styleSwapPending = true;
+    // setStyle keeps the camera, and the rebuild that follows should not
+    // re-fit: swapping the basemap must not throw away where you were
+    // looking. lastFitKey is deliberately left alone.
+    map.setStyle(styleUrl());
+  }
+
+  /** Create the data layers once. Everything the app draws on the map lives
+   *  in GeoJSON sources rendered by MapLibre itself.
+   *
+   *  This matters for more than tidiness: HTML markers are repositioned by
+   *  JavaScript on every frame, so a screenful of them visibly lags behind
+   *  while panning. Layers are drawn by the GPU in the same pass as the
+   *  basemap, so they are welded to the map however fast you drag it.
+   */
+  function ensureMapLayers(){
+    if (map.getSource("track")) return;
+
+    const empty = { type: "FeatureCollection", features: [] };
+    map.addSource("track",  { type: "geojson", data: empty });
+    map.addSource("ends",   { type: "geojson", data: empty });
+    map.addSource("runs",   { type: "geojson", data: empty });
+    map.addSource("cursor", { type: "geojson", data: empty });
+
+    // Recording gaps: a faint thin line rather than a dashed one.
+    //
+    // line-dasharray is the one line property MapLibre cannot leave to the
+    // GPU - the dash pattern is rebuilt on the CPU every time the zoom level
+    // changes, which showed up as stutter while zooming. A solid line at low
+    // opacity reads the same at a glance and costs nothing.
+    map.addLayer({
+      id: "track-gap", type: "line", source: "track",
+      filter: ["==", ["get", "gap"], true],
+      layout: { "line-cap": "butt", "line-join": "round" },
+      paint: { "line-color": ["get", "color"], "line-width": 1.5,
+               "line-opacity": 0.45 }
+    });
+    map.addLayer({
+      id: "track-line", type: "line", source: "track",
+      filter: ["!=", ["get", "gap"], true],
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: { "line-color": ["get", "color"], "line-width": 4, "line-opacity": 0.94 }
+    });
+
+    map.addLayer({
+      id: "ends-dots", type: "circle", source: "ends",
+      paint: {
+        "circle-radius": 6,
+        "circle-color": ["get", "color"],
+        "circle-stroke-width": 2,
+        "circle-stroke-color": themeColor("--marker-stroke")
+      }
+    });
+
+    map.addLayer({
+      id: "run-dots", type: "circle", source: "runs",
+      paint: {
+        "circle-radius": 7,
+        "circle-color": themeColor("--coral"),
+        "circle-stroke-width": 1.5,
+        "circle-stroke-color": themeColor("--marker-stroke")
+      }
+    });
+    map.addLayer({
+      id: "run-labels", type: "symbol", source: "runs",
+      layout: {
+        "text-field": ["get", "rank"],
+        "text-font": ["Open Sans Bold"],
+        "text-size": 9,
+        "text-allow-overlap": true,
+        "text-ignore-placement": true
+      },
+      paint: { "text-color": "#ffffff" }
+    });
+
+    map.addLayer({
+      id: "cursor-dot", type: "circle", source: "cursor",
+      paint: {
+        "circle-radius": 7,
+        "circle-color": themeColor("--coral"),
+        "circle-stroke-width": 2.5,
+        "circle-stroke-color": themeColor("--text")
+      }
+    });
+  }
+
+  /** Refresh the paint colours that come from the app's theme. */
+  function updateMapPaint(){
+    if (!map || !map.getLayer("ends-dots")) return;
+    map.setPaintProperty("ends-dots", "circle-stroke-color", themeColor("--marker-stroke"));
+    map.setPaintProperty("run-dots", "circle-color", themeColor("--coral"));
+    map.setPaintProperty("run-dots", "circle-stroke-color", themeColor("--marker-stroke"));
+    map.setPaintProperty("cursor-dot", "circle-color", themeColor("--coral"));
+    map.setPaintProperty("cursor-dot", "circle-stroke-color", themeColor("--text"));
+  }
+
+  /** Build the track, endpoints and run pins as GeoJSON and hand them over.
+   *
+   *  Band merging keeps the feature count in the dozens rather than the
+   *  thousands; colour then comes from a per-feature property, so the whole
+   *  track is drawn in a single pass.
+   */
+  function drawTrack(){
+    if (!map || !mapReady) return;
+    ensureMapLayers();
+
+    const MAX_MAP_SEGMENTS = 1500;
+    const BANDS = 14;
+    const bandOf = (speedMs) => {
+      const t = Math.max(0, Math.min(1, speedMs / maxSpeedRef));
+      return Math.min(BANDS-1, Math.floor(t * BANDS));
+    };
+
+    // With a selection, draw ONLY that stretch - the rest is left off the map
+    // rather than dimmed, so the selected part keeps its own speed colours.
+    const sel = selectionRange();
+    const from = sel ? sel[0] : 0;
+    const to   = sel ? sel[1] : points.length - 1;
+    const stride = Math.max(1, Math.ceil((to - from) / MAX_MAP_SEGMENTS));
+
+    const features = [];
+    let currentBand = null, currentPath = [], currentValid = null;
+    let minLng = Infinity, minLat = Infinity, maxLng = -Infinity, maxLat = -Infinity;
+
+    const flush = () => {
+      if (currentPath.length < 2) return;
+      const mid = (currentBand + 0.5) / BANDS * maxSpeedRef;
+      features.push({
+        type: "Feature",
+        properties: {
+          gap: !currentValid,
+          color: currentValid
+            ? (hasTime ? colorForSpeed(mid) : themeColor("--seafoam"))
+            : themeColor("--track-gap")
+        },
+        geometry: { type: "LineString", coordinates: currentPath.slice() }
+      });
+    };
+
+    for (let i=from; i<=to; i+=stride){
+      const p = points[i];
+      const coord = [p.lon, p.lat];          // GeoJSON is lng,lat
+      if (p.lon < minLng) minLng = p.lon;
+      if (p.lon > maxLng) maxLng = p.lon;
+      if (p.lat < minLat) minLat = p.lat;
+      if (p.lat > maxLat) maxLat = p.lat;
+
+      const valid = !hasTime || !p.isGap;
+      const band = (valid && hasTime) ? bandOf(p.speed) : -1;
+      if (band !== currentBand || valid !== currentValid){
+        flush();
+        currentPath = currentPath.length ? [currentPath[currentPath.length-1], coord] : [coord];
+        currentBand = band;
+        currentValid = valid;
+      } else {
+        currentPath.push(coord);
+      }
+    }
+    if ((to - from) % stride !== 0){
+      const endPt = points[to];
+      currentPath.push([endPt.lon, endPt.lat]);
+    }
+    flush();
+
+    map.getSource("track").setData({ type: "FeatureCollection", features });
+
+    // ---- endpoints ----
+    const first = points[from], last = points[to];
+    map.getSource("ends").setData({
+      type: "FeatureCollection",
+      features: [
+        { type:"Feature", properties:{ color: themeColor("--sand") },
+          geometry:{ type:"Point", coordinates:[first.lon, first.lat] } },
+        { type:"Feature", properties:{ color: themeColor("--text") },
+          geometry:{ type:"Point", coordinates:[last.lon, last.lat] } }
+      ]
+    });
+
+    // ---- run pins, only those inside what is drawn ----
+    const runFeatures = [];
+    waves.forEach((w, idx) => {
+      if (w.peakIdx < from || w.peakIdx > to) return;
+      runFeatures.push({
+        type: "Feature",
+        properties: { rank: String(idx + 1) },
+        geometry: { type: "Point", coordinates: [w.peakLon, w.peakLat] }
+      });
+    });
+    map.getSource("runs").setData({ type:"FeatureCollection", features: runFeatures });
+
+    // ---- fit, but only when what is shown has actually changed ----
+    const fitKey = from + ":" + to;
+    if (fitKey !== lastFitKey && isFinite(minLng)){
+      if (minLng !== maxLng || minLat !== maxLat){
+        map.fitBounds([[minLng, minLat], [maxLng, maxLat]],
+                      { padding: 55, maxZoom: 18, animate: false });
+      } else {
+        map.jumpTo({ center: [minLng, minLat], zoom: Math.min(map.getZoom(), 18) });
+      }
+      lastFitKey = fitKey;
+    }
+  }
+
+  /** Draw the category picker. Each row shows that category's best result,
+   *  and selecting one swaps the result list below. */
+  function renderBests(){
+    const el = document.getElementById("bestPanel");
+    el.innerHTML = "";
+    if (!hasTime){
+      el.innerHTML = `<div class="best-empty">No timestamps in this file, so speeds can't be measured.</div>`;
+      return;
+    }
+    bests = computeBests();
+    if (!bests.length){
+      el.innerHTML = `<div class="best-empty">Session too short to measure these categories.</div>`;
+      return;
+    }
+
+    // Fall back to the first available category if the selected one can't be
+    // measured in this session (a short session has no nautical mile).
+    if (!bests.some(b => b.key === selectedCategory)) selectedCategory = bests[0].key;
+
+    bests.forEach(b => {
+      const chip = document.createElement("div");
+      chip.className = "best-chip" + (b.key === selectedCategory ? " active" : "");
+      chip.setAttribute("role", "button");
+      chip.setAttribute("tabindex", "0");
+      chip.innerHTML = `<span class="cat">${b.label}</span>` +
+                       `<span class="val">${toUnit(b.speed).toFixed(2)}<small>${UNIT_LABEL[unit]}</small></span>`;
+      const pick = () => {
+        selectedCategory = b.key;
+        clearSelection();
+        renderBests();
+        renderWaveList();
+      };
+      chip.addEventListener("click", pick);
+      chip.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " "){ e.preventDefault(); pick(); }
+      });
+      el.appendChild(chip);
+    });
+  }
+
+  /** Populate the results box for the selected category. Rows are ranked
+   *  best first and clicking one selects that stretch. */
+  function renderWaveList(){
+    const el = document.getElementById("waveList");
+    const title = document.getElementById("resultsTitle");
+    el.innerHTML = "";
+
+    if (!hasTime){
+      title.textContent = "Results";
+      el.innerHTML = `<div class="no-waves">This file has no timestamps, so speed can't be calculated — the route is shown on the map only.</div>`;
+      return;
+    }
+
+    const cat = BEST_CATEGORIES.find(c => c.key === selectedCategory);
+    const rows = resultsForCategory(selectedCategory);
+    title.textContent = cat
+      ? (cat.type === "instant" ? "Fastest runs" : "Best " + cat.label + " stretches")
+      : "Results";
+
+    if (!rows.length){
+      el.innerHTML = `<div class="no-waves">Nothing to show for this category in this session.</div>`;
+      return;
+    }
+
+    currentResults = rows;
+    const top = rows[0].speed || 1;
+
+    rows.forEach((r, idx) => {
+      const div = document.createElement("div");
+      div.className = "wave-item";
+      const secs = (r.endT - r.startT);
+      div.innerHTML = `
+        <div class="wave-rank">${idx+1}</div>
+        <div class="wave-info">
+          <div class="top"><b>${toUnit(r.speed).toFixed(2)} ${UNIT_LABEL[unit]}</b></div>
+          <div class="sub">at ${fmtWall(r.startT, true)}${secs > 0 ? " &middot; " + secs.toFixed(1) + "s" : ""}</div>
+        </div>
+        <div class="wave-go">&rsaquo;</div>`;
+
+      // Bar length is relative to the best result in this list, so the shape
+      // of the session is visible at a glance. Scaled from 35% so slower
+      // entries still register as bars rather than slivers.
+      const frac = Math.max(0, Math.min(1, r.speed / top));
+      div.style.setProperty("--bar", (35 + frac * 65).toFixed(1) + "%");
+
+      div.addEventListener("click", () => focusResult(idx));
+      el.appendChild(div);
+    });
+  }
+
+  /** Select a row from the results box: highlight the stretch it came from. */
+  function focusResult(idx){
+    const r = currentResults[idx];
+    if (!r) return;
+    document.querySelectorAll(".wave-item").forEach((n,i) => n.classList.toggle("pulse", i===idx));
+    setSelection(r.startT, r.endT);
+    setCursorToTime(r.startT);
+  }
+
+  // ============================================================
+  // SELECTION
+  // A time window, chosen either by clicking a run or by ctrl-dragging on
+  // the timeline. One piece of state drives three views: the map highlight,
+  // the timeline shading, and the summary chip.
+  // ============================================================
+
+  /** Indices of the points falling inside the selected window. */
+  function selectionRange(){
+    if (!selection) return null;
+    const a = idxAtTime(selection.startT);
+    let b = idxAtTime(selection.endT);
+    if (b < a) b = a;
+    return [a, b];
+  }
+
+  /** Distance, duration and speeds for the selected window. */
+  function selectionStats(){
+    const range = selectionRange();
+    if (!range) return null;
+    const [a, b] = range;
+    let dist = 0, maxSpeed = 0, movingTime = 0;
+    for (let i = a + 1; i <= b; i++){
+      const p = points[i];
+      dist += p.dist || 0;
+      if (p.validSeg){
+        movingTime += p.dt;
+        if (p.speed > maxSpeed) maxSpeed = p.speed;
+      }
+    }
+    const dur = points[b].t - points[a].t;
+    // Average over elapsed time, matching how the session stats read.
+    const avg = dur > 0 ? dist / dur : 0;
+    return { dist, dur, maxSpeed, avg, movingTime };
+  }
+
+  function updateSelectionChip(){
+    const chip = document.getElementById("tlSel");
+    const text = document.getElementById("tlSelText");
+    const st = selectionStats();
+    if (!st){ chip.classList.remove("on"); text.textContent = ""; return; }
+    chip.classList.add("on");
+    text.innerHTML =
+      `${fmtWall(selection.startT, true)} &rarr; ${fmtWall(selection.endT, true)}` +
+      ` &middot; ${st.dur.toFixed(0)}s` +
+      ` &middot; ${toDistUnit(st.dist).toFixed(2)} ${DIST_LABEL[unit]}` +
+      ` &middot; max <b>${toUnit(st.maxSpeed).toFixed(1)}</b>` +
+      ` &middot; avg ${toUnit(st.avg).toFixed(1)} ${UNIT_LABEL[unit]}`;
+  }
+
+  /** Redraw the map for the current selection.
+   *
+   *  There is no highlight overlay: drawTrack() simply renders the selected
+   *  stretch and nothing else, so the visible line keeps its ordinary speed
+   *  colours. Fitting the view is left to drawTrack's own fitBounds, which
+   *  is already computed from whatever it drew. */
+  function drawSelectionOnMap(){
+    if (!map) return;
+    try { drawTrack(); } catch (e){ console.error("Map redraw failed:", e); }
+  }
+
+  /** Set the selected window. Times may arrive in either order. */
+  function setSelection(t0, t1, opts){
+    opts = opts || {};
+    const lo = Math.min(t0, t1), hi = Math.max(t0, t1);
+    // A ctrl-click with no drag is a clear, not a zero-width selection.
+    if (hi - lo < 1){ clearSelection(); return; }
+    selection = { startT: lo, endT: hi };
+    drawSelectionOnMap();
+    updateSelectionChip();
+    scheduleTimeline();
+  }
+
+  function clearSelection(){
+    const had = selection !== null;
+    selection = null;
+    document.querySelectorAll(".wave-item").forEach(n => n.classList.remove("pulse"));
+    updateSelectionChip();
+    // Only redraw if something was actually showing, so this stays cheap
+    // when called during setup.
+    if (had) drawSelectionOnMap();
+    scheduleTimeline();
+  }
+
+  // ============================================================
+  // TIMELINE
+  // ------------------------------------------------------------
+  // A hand-written <canvas> chart of speed (y) against wall-clock time (x).
+  //
+  // WHY NOT A CHARTING LIBRARY
+  // This started on Chart.js and did not survive contact with real data. A
+  // 100-minute session at 1Hz is ~6,000 points; asking a general-purpose
+  // library to draw that many bezier segments with per-point colours was slow
+  // enough that the chart effectively never appeared.
+  //
+  // The fix is the standard audio-waveform trick: you only have as many pixel
+  // columns as the canvas is wide, so for each column find the min and max
+  // speed in the time slice it covers and draw one vertical line between
+  // them. Cost is O(visible pixels), not O(points), and no spike is ever
+  // averaged away - a 1-second peak still paints a full-height column. A full
+  // session renders in about 5ms and stays that fast at any zoom.
+  //
+  // VIEW MODEL
+  //   tlViewStart / tlViewSpan  the visible time window, in elapsed seconds
+  //   tlCursorIdx               the scrub cursor, an index into `points`
+  // Arrow keys move the cursor; the window follows when the cursor nears an
+  // edge (ensureCursorVisible). Zoom keeps the cursor anchored in place.
+  //
+  // TIME DISPLAY
+  // Internally everything is elapsed seconds - simpler maths, and it is what
+  // `points[i].t` holds. Only at label time is it converted to wall-clock via
+  // wallDate(), using the browser's local timezone. Axis ticks are aligned to
+  // round clock boundaries (12:30, 13:00), not to when recording started.
+  // ============================================================
+
+  // Session bounds in elapsed seconds. sessionDur() floors at 1 to keep it
+  // safe as a divisor for degenerate single-point files.
+  function sessionStart(){ return points[0].t; }
+  function sessionEnd(){ return points[points.length-1].t; }
+  function sessionDur(){ return Math.max(1, sessionEnd() - sessionStart()); }
+
+  /** Binary search for the first point at or after an elapsed time.
+   *  Called once per pixel column per frame, so it needs to stay O(log n).
+   *  Always returns a valid in-range index (clamps at both ends). */
+  function idxAtTime(tSec){
+    let lo = 0, hi = points.length - 1;
+    while (lo < hi){
+      const mid = (lo + hi) >> 1;
+      if (points[mid].t < tSec) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+  }
+
+  /** Top of the y-axis in display units: true session max plus 12% headroom
+   *  so the fastest peak doesn't touch the ceiling. Uses the real max, not a
+   *  percentile - clipping your best run off the top of the chart would be
+   *  worse than a slightly generous scale. */
+  function tlMaxSpeedUnit(){
+    let mx = 0;
+    for (const p of points) if (p.validSeg && p.speed > mx) mx = p.speed;
+    return Math.max(0.1, toUnit(mx) * 1.12);
+  }
+
+  /** Pick a human tick interval (5s, 30s, 5min, 30min...) that yields roughly
+   *  targetTicks labels across the given span. */
+  function niceTimeStep(spanSec, targetTicks){
+    const raw = spanSec / targetTicks;
+    const steps = [5,10,15,30,60,120,300,600,900,1800,3600,7200];
+    for (const s of steps) if (raw <= s) return s;
+    return 7200;
+  }
+
+  // Wall-clock helpers: elapsed seconds -> the real time of day the tracker
+  // recorded, shown in the viewer's local timezone.
+  function wallDate(tSec){
+    const base = points[0].time.getTime();
+    return new Date(base + (tSec - points[0].t) * 1000);
+  }
+
+  /** Clock readings, in the viewer's local time.
+   *
+   *  Both formats record UTC - GPX timestamps carry a Z, and the .sbp packed
+   *  datetime is UTC by specification - so this converts. Local is what the
+   *  session actually felt like: the hour you were on the water. */
+  function fmtWall(tSec, withSeconds){
+    const d = wallDate(tSec);
+    const hh = String(d.getHours()).padStart(2,"0");
+    const mm = String(d.getMinutes()).padStart(2,"0");
+    if (!withSeconds) return `${hh}:${mm}`;
+    return `${hh}:${mm}:${String(d.getSeconds()).padStart(2,"0")}`;
+  }
+
+  // Local seconds-since-midnight for a given elapsed time, so axis ticks can be
+  // aligned to round clock boundaries rather than to when recording started.
+  function wallSecOfDay(tSec){
+    const d = wallDate(tSec);
+    return d.getHours()*3600 + d.getMinutes()*60 + d.getSeconds();
+  }
+
+  /** Coalesce redraw requests into one per animation frame. Scrubbing fires
+   *  far more events than the screen can show; without this, held arrow keys
+   *  or a drag would queue redundant full redraws. */
+  function scheduleTimeline(){
+    if (tlRafPending) return;
+    tlRafPending = true;
+    requestAnimationFrame(() => { tlRafPending = false; drawTimeline(); });
+  }
+
+  /** Draw the whole timeline. Full repaint each time - cheap enough that
+   *  partial invalidation isn't worth the complexity.
+   *
+   *  Layer order (back to front): grid + speed labels, speed envelope,
+   *  planing threshold, time axis, run bands, cursor.
+   *
+   *  The canvas is sized to devicePixelRatio (capped at 2) for crisp lines on
+   *  retina screens without quadrupling fill cost on a 3x phone.
+   *
+   *  padL/padR/padT/padB define the plot box. If you change padL, change it
+   *  in timeAtClientX() too or clicks will land offset from the cursor. */
+  function drawTimeline(){
+    const canvas = document.getElementById("timelineCanvas");
+    if (!canvas || !points.length) return;
+    const cssW = canvas.clientWidth, cssH = canvas.clientHeight;
+    if (cssW < 10 || cssH < 10) return;
+
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    if (canvas.width !== Math.round(cssW*dpr) || canvas.height !== Math.round(cssH*dpr)){
+      canvas.width = Math.round(cssW*dpr);
+      canvas.height = Math.round(cssH*dpr);
+    }
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssW, cssH);
+
+    const padL = 38, padR = 8, padT = 10, padB = 18;
+    const plotW = cssW - padL - padR;
+    const plotH = cssH - padT - padB;
+    if (plotW < 10 || plotH < 10) return;
+
+    const yMax = tlMaxSpeedUnit();
+    const yOf = v => padT + plotH - (v / yMax) * plotH;
+    const xOf = t => padL + ((t - tlViewStart) / tlViewSpan) * plotW;
+
+    // ---- horizontal grid + speed labels
+    // Ticks land on round numbers (10, 20, 30…) instead of arbitrary fractions
+    // of the peak. The unit lives in the header above, so the axis stays as
+    // bare numbers.
+    // Canvas takes a literal font string - it can't read CSS variables.
+    // Keep in sync with --font-body.
+    // Canvas can't read CSS variables directly, so resolve them once per draw.
+    // This is what makes the timeline follow the light/dark theme.
+    const cGrid   = themeColor("--grid");
+    const cText   = themeColor("--text-dim");
+    const cThresh = themeColor("--thresh-line");
+    const cCursor = themeColor("--cursor-line");
+    const cBand   = themeColor("--run-band");
+    const cDim    = themeColor("--sel-dim");
+    const cSelEdge = themeColor("--sel-edge");
+    const cStroke = themeColor("--marker-stroke");
+
+    ctx.font = "10px 'Open Sans', system-ui, sans-serif";
+    ctx.textBaseline = "middle";
+    ctx.textAlign = "right";
+
+    const unitEl = document.getElementById("tlUnit");
+    if (unitEl) unitEl.textContent = `speed in ${UNIT_LABEL[unit]}`;
+
+    const niceSteps = [1,2,2.5,5,10,15,20,25,50,100];
+    let yStep = niceSteps[niceSteps.length-1];
+    for (const s of niceSteps){ if (s >= yMax/5){ yStep = s; break; } }
+
+    const tickVals = [];
+    for (let v = yStep; v <= yMax; v += yStep) tickVals.push(v);
+
+    // zero line, drawn without a label so it doesn't crowd the time axis below
+    ctx.strokeStyle = cGrid;
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, yOf(0) + 0.5); ctx.lineTo(cssW - padR, yOf(0) + 0.5); ctx.stroke();
+
+    tickVals.forEach((v) => {
+      const y = yOf(v);
+      ctx.strokeStyle = cGrid;
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(padL, y + 0.5); ctx.lineTo(cssW - padR, y + 0.5); ctx.stroke();
+      ctx.fillStyle = cText;
+      ctx.fillText(Number.isInteger(v) ? String(v) : v.toFixed(1), padL - 8, y);
+    });
+
+    // ---- speed envelope, one column per pixel
+    const secPerPx = tlViewSpan / plotW;
+    for (let px = 0; px < plotW; px++){
+      const t0 = tlViewStart + px * secPerPx;
+      const t1 = t0 + secPerPx;
+      let i0 = idxAtTime(t0), i1 = idxAtTime(t1);
+      if (i1 <= i0) i1 = Math.min(points.length - 1, i0 + 1);
+      let mn = Infinity, mx = -Infinity;
+      for (let i = i0; i <= i1 && i < points.length; i++){
+        const p = points[i];
+        if (!p.validSeg) continue;
+        const v = toUnit(p.speed);
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+      }
+      if (mn === Infinity) continue;
+      const x = padL + px + 0.5;
+      ctx.strokeStyle = colorForSpeed(mx / UNIT_FACTOR[unit]);
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x, yOf(mn));
+      ctx.lineTo(x, yOf(mx) - 0.8);
+      ctx.stroke();
+    }
+
+    // ---- planing threshold
+    const threshUnit = toUnit(PLANING_THRESHOLD_KMH / 3.6);
+    if (threshUnit < yMax){
+      const y = yOf(threshUnit);
+      ctx.save();
+      ctx.setLineDash([4,4]);
+      ctx.strokeStyle = cThresh;
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(padL, y + 0.5); ctx.lineTo(cssW - padR, y + 0.5); ctx.stroke();
+      ctx.restore();
+    }
+
+    // ---- time axis (real clock time, ticks on round clock boundaries)
+    const step = niceTimeStep(tlViewSpan, 6);
+    const startWall = wallSecOfDay(tlViewStart);
+    const firstOffset = (Math.ceil(startWall / step) * step) - startWall;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    ctx.fillStyle = cText;
+    for (let t = tlViewStart + firstOffset; t <= tlViewStart + tlViewSpan; t += step){
+      const x = xOf(t);
+      if (x < padL - 1 || x > cssW - padR + 1) continue;
+      ctx.strokeStyle = cGrid;
+      ctx.beginPath(); ctx.moveTo(x + 0.5, padT); ctx.lineTo(x + 0.5, padT + plotH); ctx.stroke();
+      ctx.fillText(fmtWall(t, step < 60), x, padT + plotH + 4);
+    }
+
+    // ---- run bands (so you can see where the fast stretches are)
+    waves.forEach(w => {
+      const x0 = xOf(w.startT), x1 = xOf(w.endT);
+      if (x1 < padL || x0 > cssW - padR) return;
+      ctx.fillStyle = cBand;
+      ctx.fillRect(Math.max(padL, x0), padT, Math.min(cssW - padR, x1) - Math.max(padL, x0), plotH);
+    });
+
+    // ---- selection: dim everything outside the chosen window, and mark
+    // its edges. Drawn after the trace so the dimming actually reads.
+    const activeSel = tlSelecting ? { startT: Math.min(tlSelAnchor, tlSelCurrent),
+                                      endT:   Math.max(tlSelAnchor, tlSelCurrent) }
+                                  : selection;
+    if (activeSel){
+      const sx0 = Math.max(padL, xOf(activeSel.startT));
+      const sx1 = Math.min(cssW - padR, xOf(activeSel.endT));
+
+      ctx.fillStyle = cDim;
+      if (sx0 > padL) ctx.fillRect(padL, padT, sx0 - padL, plotH);
+      if (sx1 < cssW - padR) ctx.fillRect(sx1, padT, (cssW - padR) - sx1, plotH);
+
+      if (sx1 > sx0){
+        ctx.strokeStyle = cSelEdge;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(sx0 + 0.5, padT); ctx.lineTo(sx0 + 0.5, padT + plotH);
+        ctx.moveTo(sx1 - 0.5, padT); ctx.lineTo(sx1 - 0.5, padT + plotH);
+        ctx.stroke();
+
+        // little handles top and bottom, so the edges read as grabbable bounds
+        ctx.fillStyle = cSelEdge;
+        [sx0, sx1].forEach(x => {
+          ctx.fillRect(x - 1.5, padT, 3, 5);
+          ctx.fillRect(x - 1.5, padT + plotH - 5, 3, 5);
+        });
+      }
+    }
+
+    // ---- cursor
+    const cp = points[tlCursorIdx];
+    if (cp){
+      const cx = xOf(cp.t);
+      if (cx >= padL && cx <= cssW - padR){
+        ctx.strokeStyle = cCursor;
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(cx + 0.5, padT); ctx.lineTo(cx + 0.5, padT + plotH); ctx.stroke();
+        const cy = yOf(toUnit(cp.speed));
+        ctx.fillStyle = colorForSpeed(cp.speed);
+        ctx.strokeStyle = cStroke;
+        ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(cx, cy, 4.5, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+      }
+    }
+  }
+
+  /** Update the text readout beside the timeline title: clock time, speed at
+   *  the cursor, and which run the cursor sits inside (if any). */
+  function updateReadout(){
+    const el = document.getElementById("tlReadout");
+    const p = points[tlCursorIdx];
+    if (!p){ el.textContent = ""; return; }
+    const inRun = waves.findIndex(w => p.t >= w.startT && p.t <= w.endT);
+    const runTxt = inRun >= 0 ? ` &middot; in run ${inRun+1}` : "";
+    el.innerHTML = `<span class="t">${fmtWall(p.t, true)}</span> &middot; <b>${toUnit(p.speed).toFixed(1)} ${UNIT_LABEL[unit]}</b>${runTxt}`;
+  }
+
+  /** Move (or lazily create) the map dot that tracks the timeline cursor, so
+   *  scrubbing the graph shows you where on the water that moment happened. */
+  function updateCursorMarker(){
+    const p = points[tlCursorIdx];
+    if (!p || !map) return;
+    if (!mapReady || !map.getSource("cursor")) return;
+    // Drawn as a layer, not an HTML marker: markers are moved by JavaScript
+    // every frame and visibly trail behind while panning.
+    map.getSource("cursor").setData({
+      type: "FeatureCollection",
+      features: [{ type:"Feature", properties:{},
+                   geometry:{ type:"Point", coordinates:[p.lon, p.lat] } }]
+    });
+  }
+
+  /** Index of the track point nearest a clicked position, or -1 if the click
+   *  was too far from the track to mean anything.
+   *
+   *  Only points currently drawn are considered, so clicking while a run is
+   *  selected can't jump you somewhere off-screen. Note a track that crosses
+   *  itself is inherently ambiguous - several passes over the same water are
+   *  equally "nearest", and the earliest of them wins. */
+  function nearestPointIndex(latlng, maxPixels){
+    if (!points.length || !map) return -1;
+    const range = selectionRange();
+    const from = range ? range[0] : 0;
+    const to   = range ? range[1] : points.length - 1;
+
+    // Coarse pass in degree space (cheap), scaled so longitude doesn't
+    // dominate at this latitude.
+    const cosLat = Math.cos(latlng.lat * Math.PI / 180);
+    let bestIdx = -1, bestD2 = Infinity;
+    for (let i = from; i <= to; i++){
+      const dLat = points[i].lat - latlng.lat;
+      const dLon = (points[i].lon - latlng.lng) * cosLat;
+      const d2 = dLat*dLat + dLon*dLon;
+      if (d2 < bestD2){ bestD2 = d2; bestIdx = i; }
+    }
+    if (bestIdx < 0) return -1;
+
+    // Then confirm in screen space, so the tolerance means the same thing at
+    // every zoom level.
+    const a = map.project(latlng);
+    const b = map.project([points[bestIdx].lon, points[bestIdx].lat]);
+    const px = Math.sqrt((a.x-b.x)*(a.x-b.x) + (a.y-b.y)*(a.y-b.y));
+    return px <= maxPixels ? bestIdx : -1;
+  }
+
+  /** Scroll the view window if the cursor has come within 12% of an edge,
+   *  so arrowing off-screen pulls the timeline along instead of losing it. */
+  function ensureCursorVisible(){
+    const t = points[tlCursorIdx].t;
+    const margin = tlViewSpan * 0.12;
+    if (t < tlViewStart + margin) tlViewStart = t - margin;
+    else if (t > tlViewStart + tlViewSpan - margin) tlViewStart = t - tlViewSpan + margin;
+    clampView();
+  }
+
+  /** Keep the view window inside the session bounds. */
+  function clampView(){
+    const maxStart = sessionEnd() - tlViewSpan;
+    if (tlViewStart > maxStart) tlViewStart = maxStart;
+    if (tlViewStart < sessionStart()) tlViewStart = sessionStart();
+  }
+
+  /** Move the cursor by N points and resync readout, map dot and canvas.
+   *  Note it steps by INDEX, not by time: one press = one GPS sample, which
+   *  is one second on typical 1Hz trackers. */
+  function moveCursor(deltaIdx){
+    tlCursorIdx = Math.max(0, Math.min(points.length - 1, tlCursorIdx + deltaIdx));
+    ensureCursorVisible();
+    updateReadout();
+    updateCursorMarker();
+    scheduleTimeline();
+  }
+
+  /** Jump the cursor to a given elapsed time. Used by click/drag scrubbing
+   *  and by sidebar run clicks. */
+  function setCursorToTime(tSec){
+    tlCursorIdx = idxAtTime(tSec);
+    ensureCursorVisible();
+    updateReadout();
+    updateCursorMarker();
+    scheduleTimeline();
+  }
+
+  /** Zoom about the cursor (factor < 1 zooms in, > 1 out), holding the cursor
+   *  at the same screen position so you don't lose your place. Clamped between
+   *  a 20s floor and the full session. */
+  function zoomTimeline(factor){
+    const anchor = points[tlCursorIdx] ? points[tlCursorIdx].t : tlViewStart + tlViewSpan/2;
+    const rel = (anchor - tlViewStart) / tlViewSpan;
+    const minSpan = Math.min(20, sessionDur());
+    tlViewSpan = Math.max(minSpan, Math.min(sessionDur(), tlViewSpan * factor));
+    tlViewStart = anchor - rel * tlViewSpan;
+    clampView();
+    scheduleTimeline();
+  }
+
+  /** Reset the timeline for a newly loaded session: full zoom out, cursor at
+   *  the start, stale map dot cleared. */
+  function initTimeline(){
+    clearSelection();
+    tlViewStart = sessionStart();
+    tlViewSpan = sessionDur();
+    tlCursorIdx = 0;
+    if (map && mapReady && map.getSource("cursor")){
+      map.getSource("cursor").setData({ type:"FeatureCollection", features: [] });
+    }
+    updateReadout();
+    updateCursorMarker();
+    scheduleTimeline();
+  }
+
+  /** Fill the four header stats. Distance sums every segment (including
+   *  invalid ones - you did still travel that ground); speed stats use only
+   *  valid segments so recording gaps can't fake a top speed. */
+  function renderStats(){
+    const validPts = points.filter(p=>p.validSeg);
+    const totalDist = points.reduce((s,p)=>s+(p.dist||0),0);
+    const totalDur = hasTime ? (points[points.length-1].t - points[0].t) : null;
+    const maxSpeed = validPts.length ? Math.max(...validPts.map(p=>p.speed)) : 0;
+
+    document.getElementById("mDist").textContent = toDistUnit(totalDist).toFixed(2) + " " + DIST_LABEL[unit];
+    document.getElementById("mDuration").textContent = totalDur!=null ? fmtDuration(totalDur) : "—";
+    document.getElementById("mMaxSpeed").textContent = hasTime ? toUnit(maxSpeed).toFixed(1) + " " + UNIT_LABEL[unit] : "—";
+    document.getElementById("mWaves").textContent = hasTime ? waves.length : "—";
+  }
+
+  /** Re-derive runs and redraw everything. Called on load and whenever the
+   *  display unit changes.
+   *
+   *  ORDER MATTERS: stats and the run list are rendered first, then the map
+   *  and timeline inside try/catch. If a heavy canvas/map draw ever fails on
+   *  some device, the numbers are already on screen rather than the page
+   *  ending up blank. (This is exactly how an earlier bug presented, so the
+   *  ordering is intentional - please keep it.) */
+  /** Set the reference speed the colour ramp is scaled against.
+   *
+   *  A 97th percentile rather than the true maximum, so one bad fix can't
+   *  wash out the whole palette. Lives here rather than inside drawTrack
+   *  because the timeline needs it too, and the timeline can render before
+   *  the map style has finished loading.
+   */
+  function computeSpeedRef(){
+    const speeds = points.filter(p => p.validSeg).map(p => p.speed);
+    maxSpeedRef = speeds.length ? percentile(speeds, 0.97) : 1;
+    if (maxSpeedRef <= 0) maxSpeedRef = 1;
+  }
+
+  function rebuildAll(){
+    const threshMs = PLANING_THRESHOLD_KMH/3.6;
+    waves = hasTime ? detectWaves(points, threshMs, 1.2) : [];
+    computeSpeedRef();
+    // Stats first: even if map rendering hits a browser limit below,
+    // the numbers the person actually asked for are already on screen.
+    renderStats();
+    renderBests();
+    renderWaveList();
+    try { drawTrack(); } catch (e){ console.error("Map rendering failed:", e); }
+    try {
+      if (hasTime) scheduleTimeline();
+    } catch (e){ console.error("Timeline rendering failed:", e); }
+  }
+
+  // ============================================================
+  // LOAD FLOW
+  // ============================================================
+
+  /** Take raw points, run the pipeline, swap the UI from dropzone to
+   *  dashboard. The brief setTimeout lets the layout settle so Leaflet and
+   *  the canvas measure a real size before their first draw.
+   *  @param {Array} rawPoints from parseGPX() or parseSBP()
+   *  @param {string} label shown under the title (usually the filename) */
+  function loadPoints(rawPoints, label){
+    try {
+      if (rawPoints.length < 2) throw new Error("Not enough track points in this file.");
+      points = computeDerived(rawPoints);
+      lastFitKey = null;   // new session: always fit, even if the range key repeats
+      document.getElementById("emptyWrap").style.display = "none";
+      document.getElementById("dash").style.display = "flex";
+      document.getElementById("sessionMeta").style.display = "flex";
+      document.getElementById("tagline").textContent = label || "Session loaded.";
+      if (!map) initMap();
+      setTimeout(() => {
+        try {
+          map.resize();
+          rebuildAll();
+          if (hasTime){
+            document.getElementById("timeline").style.display = "flex";
+            initTimeline();
+          } else {
+            document.getElementById("timeline").style.display = "none";
+          }
+        }
+        catch (e){ console.error("Rendering the session failed:", e); showError("Something went wrong rendering this session — the console has details."); }
+      }, 60);
+    } catch (e){
+      showError(e.message);
+    }
+  }
+
+  /** Surface a message in the dropzone. Parse/read failures only. */
+  function showError(msg){
+    // The message lives inside the dropzone, so make sure the dropzone is
+    // actually on screen. Picking an unreadable file while a session is open
+    // would otherwise fail in silence.
+    showDropzone();
+    const el = document.getElementById("errorMsg");
+    el.textContent = msg;
+    el.style.display = "block";
+  }
+
+  /** Read a File (from the picker or a drop) and push it through the pipeline. */
+  function handleFile(file){
+    document.getElementById("errorMsg").style.display = "none";
+    const label = file.name.replace(/\.(gpx|sbp)$/i, "");
+    const isBinary = /\.sbp$/i.test(file.name);
+    const reader = new FileReader();
+
+    reader.onload = () => {
+      try {
+        const pts = isBinary
+          ? parseSBP(reader.result)
+          : parseGPX(reader.result);
+        loadPoints(pts, label);
+      } catch (e){ showError(e.message); }
+    };
+    reader.onerror = () => showError("Couldn't read that file.");
+
+    // .sbp is binary, .gpx is XML text - they need different read modes.
+    if (isBinary) reader.readAsArrayBuffer(file);
+    else reader.readAsText(file);
+  }
+
+  // ============================================================
+  // UI WIRING
+  // File picker, drag & drop, unit switch, basemap panel.
+  // ============================================================
+  const dropzone = document.getElementById("dropzone");
+  const fileInput = document.getElementById("fileInput");
+
+  document.getElementById("chooseFileBtn").addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", (e) => { if (e.target.files[0]) handleFile(e.target.files[0]); });
+
+  ["dragenter","dragover"].forEach(evt => dropzone.addEventListener(evt, (e) => {
+    e.preventDefault(); dropzone.classList.add("drag");
+  }));
+  ["dragleave","drop"].forEach(evt => dropzone.addEventListener(evt, (e) => {
+    e.preventDefault(); dropzone.classList.remove("drag");
+  }));
+  dropzone.addEventListener("drop", (e) => {
+    const f = e.dataTransfer.files[0];
+    if (f) handleFile(f);
+  });
+
+  // ---------------- Display menu ----------------
+  const displayBtn  = document.getElementById("displayBtn");
+  const displayMenu = document.getElementById("displayMenu");
+
+  function setMenu(open){
+    displayMenu.classList.toggle("is-hidden", !open);
+    displayBtn.setAttribute("aria-expanded", open ? "true" : "false");
+  }
+
+  displayBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    setMenu(displayMenu.classList.contains("is-hidden"));
+  });
+
+  // Clicks inside the panel must not close it - changing units and then the
+  // basemap in one visit is the normal case.
+  displayMenu.addEventListener("click", (e) => e.stopPropagation());
+
+  document.addEventListener("click", () => setMenu(false));
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !displayMenu.classList.contains("is-hidden")) setMenu(false);
+  });
+
+  // Straight to the file picker rather than back to the dropzone: with a
+  // session already open, the dropzone is a step you have to click through
+  // rather than something you wanted to see. The current session stays put
+  // until a new file is actually chosen, so cancelling leaves you where you
+  // were instead of on an empty screen.
+  document.getElementById("newFileBtn").addEventListener("click", () => {
+    setMenu(false);
+    if (points.length){
+      fileInput.value = "";      // so re-picking the same file still fires
+      fileInput.click();
+      return;
+    }
+    showDropzone();
+  });
+
+  /** Return to the empty state. */
+  function showDropzone(){
+    document.getElementById("emptyWrap").style.display = "flex";
+    document.getElementById("dash").style.display = "none";
+    document.getElementById("timeline").style.display = "none";
+    document.getElementById("sessionMeta").style.display = "none";
+    document.getElementById("tagline").textContent = "Your GPS Tracker";
+  }
+
+  document.getElementById("unitSeg").addEventListener("click", (e) => {
+    const btn = e.target.closest("button"); if (!btn) return;
+    unit = btn.dataset.unit;
+    document.querySelectorAll("#unitSeg button").forEach(b => b.classList.toggle("active", b===btn));
+    if (points.length){ rebuildAll(); updateReadout(); updateSelectionChip(); }
+  });
+
+  // ---------------- Theme ----------------
+  // Dark is the default; the toggle flips a data-theme attribute on <html>
+  // and every colour follows, because they all resolve from CSS variables.
+  // The map and timeline need an explicit redraw since their colours were
+  // baked into canvas/Leaflet at draw time rather than being live CSS.
+  function applyTheme(mode){
+    const root = document.documentElement;
+    if (mode === "light") root.setAttribute("data-theme", "light");
+    else root.removeAttribute("data-theme");
+
+    const btn = document.getElementById("themeToggle");
+    btn.setAttribute("aria-pressed", mode === "light" ? "true" : "false");
+    document.getElementById("themeIcon").textContent  = mode === "light" ? "☀" : "☾";
+    document.getElementById("themeLabel").textContent = mode === "light" ? "Light" : "Dark";
+
+    // The basemap has its own control now, so a theme change only repaints
+    // the app's own layers.
+    if (map && mapReady){
+      try { updateMapPaint(); drawTrack(); } catch (e){ console.error("Map repaint failed:", e); }
+    }
+    if (points.length && hasTime){ updateCursorMarker(); scheduleTimeline(); }
+  }
+
+  document.getElementById("themeToggle").addEventListener("click", () => {
+    currentTheme = currentTheme === "dark" ? "light" : "dark";
+    applyTheme(currentTheme);
+  });
+
+  // ---------------- Desktop shell hook ----------------
+  // The Tauri wrapper calls this when the app is launched by double-clicking
+  // a .gpx file, or when one is opened while the app is already running.
+  // Harmless in a plain browser - nothing ever calls it.
+  window.__windlogOpenTrack = function(name, kind, payload){
+    try {
+      const label = String(name || "Session").replace(/\.(gpx|sbp)$/i, "");
+      let pts;
+      if (kind === "sbp"){
+        // Binary, so it arrives base64 encoded - turn it back into bytes.
+        const bin = atob(payload);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        pts = parseSBP(bytes.buffer);
+      } else {
+        pts = parseGPX(payload);
+      }
+      loadPoints(pts, label);
+    } catch (e){
+      document.getElementById("emptyWrap").style.display = "flex";
+      showError(e.message);
+    }
+  };
+
+  document.getElementById("basemapSeg").addEventListener("click", (e) => {
+    const btn = e.target.closest("button"); if (!btn) return;
+    document.querySelectorAll("#basemapSeg button").forEach(b => b.classList.toggle("active", b===btn));
+    basemapMode = btn.dataset.basemap;
+    setBasemapStyle();
+  });
+
+  // Clicking the track jumps the cursor to that moment. The tolerance is in
+  // screen pixels, so it feels the same however far you are zoomed in.
+  function wireMapClick(){
+    if (!map) return;
+    map.on("click", (e) => {
+      if (!points.length || !hasTime) return;
+      const idx = nearestPointIndex({ lat: e.lngLat.lat, lng: e.lngLat.lng }, 25);
+      if (idx < 0) return;              // clicked empty water - ignore
+      setCursorToTime(points[idx].t);
+    });
+  }
+
+  // ============================================================
+  // TIMELINE INTERACTION
+  // Keyboard is the primary interface (arrows scrub, +/- zoom, home/end
+  // jump); pointer drag and wheel are there for mouse users.
+  // ============================================================
+  document.getElementById("tlSelClear").addEventListener("click", clearSelection);
+  document.getElementById("tlZoomIn").addEventListener("click", () => { if (points.length) zoomTimeline(0.5); });
+  document.getElementById("tlZoomOut").addEventListener("click", () => { if (points.length) zoomTimeline(2); });
+
+  const tlCanvas = document.getElementById("timelineCanvas");
+
+  /** Map a viewport x-coordinate to an elapsed time in the current view.
+   *  padL/padR MUST match drawTimeline() or the cursor lands offset from the
+   *  pointer. */
+  function timeAtClientX(clientX){
+    const rect = tlCanvas.getBoundingClientRect();
+    const padL = 38, padR = 8;   // must match drawTimeline
+    const plotW = rect.width - padL - padR;
+    const rel = Math.max(0, Math.min(1, (clientX - rect.left - padL) / plotW));
+    return tlViewStart + rel * tlViewSpan;
+  }
+
+  let tlDragging = false;
+  tlCanvas.addEventListener("pointerdown", (e) => {
+    if (!points.length || !hasTime) return;
+    tlCanvas.setPointerCapture(e.pointerId);
+    document.getElementById("timeline").focus();
+
+    // Ctrl (or Cmd on a Mac) turns the drag into a range selection instead
+    // of a scrub. Held modifiers are read per-event, so the choice is made
+    // at press time and stays consistent for the whole drag.
+    if (e.ctrlKey || e.metaKey){
+      tlSelecting = true;
+      tlSelAnchor = timeAtClientX(e.clientX);
+      tlSelCurrent = tlSelAnchor;
+      scheduleTimeline();
+    } else {
+      tlDragging = true;
+      setCursorToTime(timeAtClientX(e.clientX));
+    }
+  });
+
+  tlCanvas.addEventListener("pointermove", (e) => {
+    if (tlSelecting){
+      tlSelCurrent = timeAtClientX(e.clientX);
+      scheduleTimeline();
+    } else if (tlDragging){
+      setCursorToTime(timeAtClientX(e.clientX));
+    }
+  });
+
+  ["pointerup","pointercancel"].forEach(evt =>
+    tlCanvas.addEventListener(evt, () => {
+      if (tlSelecting){
+        tlSelecting = false;
+        setSelection(tlSelAnchor, tlSelCurrent);
+      }
+      tlDragging = false;
+    })
+  );
+
+  tlCanvas.addEventListener("wheel", (e) => {
+    if (!points.length || !hasTime) return;
+    e.preventDefault();
+    if (e.ctrlKey || Math.abs(e.deltaY) > Math.abs(e.deltaX)){
+      zoomTimeline(e.deltaY > 0 ? 1.15 : 0.87);
+    } else {
+      tlViewStart += (e.deltaX / tlCanvas.clientWidth) * tlViewSpan;
+      clampView();
+      scheduleTimeline();
+    }
+  }, { passive: false });
+
+  window.addEventListener("keydown", (e) => {
+    if (!points.length || !hasTime) return;
+    const tag = (e.target.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "textarea") return;
+
+    const fast = e.shiftKey ? 15 : 1;
+    switch (e.key){
+      case "ArrowRight": e.preventDefault(); moveCursor(fast); break;
+      case "ArrowLeft":  e.preventDefault(); moveCursor(-fast); break;
+      case "Home":       e.preventDefault(); tlCursorIdx = 0; ensureCursorVisible(); updateReadout(); updateCursorMarker(); scheduleTimeline(); break;
+      case "End":        e.preventDefault(); tlCursorIdx = points.length-1; ensureCursorVisible(); updateReadout(); updateCursorMarker(); scheduleTimeline(); break;
+      case "+": case "=": e.preventDefault(); zoomTimeline(0.5); break;
+      case "-": case "_": e.preventDefault(); zoomTimeline(2); break;
+      case "Escape": if (selection){ e.preventDefault(); clearSelection(); } break;
+      default: return;
+    }
+  });
+
+  let tlResizeTimer = null;
+  window.addEventListener("resize", () => {
+    clearTimeout(tlResizeTimer);
+    tlResizeTimer = setTimeout(() => { if (points.length && hasTime) scheduleTimeline(); }, 150);
+  });
+
+})();
+</script>
+
+<script>
+// ---------------------------------------------------------------------
+// Tauri bridge. Only does anything inside the desktop app; in a browser
+// window.__TAURI__ is undefined and this block is skipped entirely.
+// ---------------------------------------------------------------------
+(function(){
+  "use strict";
+  if (!window.__TAURI__) return;
+
+  const { invoke } = window.__TAURI__.core;
+  const { listen }  = window.__TAURI__.event;
+
+  function hand(file){
+    if (!file || !file.contents || !window.__windlogOpenTrack) return;
+    window.__windlogOpenTrack(file.name, file.kind, file.contents);
+  }
+
+  // Launched by opening a file? Collect it once the UI exists.
+  window.addEventListener("DOMContentLoaded", () => {
+    invoke("take_opened_file").then(hand).catch(e => console.error("take_opened_file:", e));
+  });
+
+  // macOS: a file opened while the app is already running arrives as an event.
+  listen("gpx-opened", (evt) => hand(evt.payload))
+    .catch(e => console.error("listen(gpx-opened):", e));
+})();
+</script>
+</body>
+</html>

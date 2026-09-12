@@ -1,0 +1,119 @@
+# Builds GPSFlow for Windows, macOS and Linux, and attaches the installers
+# to a GitHub release.
+#
+# HOW TO USE IT
+#   1. Push this project to a GitHub repository.
+#   2. Bump "version" in src-tauri/tauri.conf.json (and Cargo.toml) if you
+#      want a new number.
+#   3. Tag and push:
+#          git tag v1.0.0
+#          git push origin v1.0.0
+#   4. Wait ~20 minutes. A DRAFT release appears under the Releases tab with
+#      all the installers attached. Review it, then publish.
+#
+# You can also run it by hand from the Actions tab (workflow_dispatch), which
+# is handy for checking the build works before committing to a tag.
+#
+# WHY A MATRIX: each platform must be compiled on itself. Tauri links against
+# the operating system's own webview, and Apple's toolchain only runs on
+# macOS, so there is no cross-compiling from one machine.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# Needed so the action can create the release and upload to it.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false          # one platform failing shouldn't bin the others
+      matrix:
+        include:
+          # Apple silicon
+          - platform: macos-latest
+            args: "--target aarch64-apple-darwin"
+            rust-targets: aarch64-apple-darwin
+          # Intel Macs
+          - platform: macos-latest
+            args: "--target x86_64-apple-darwin"
+            rust-targets: x86_64-apple-darwin
+          - platform: ubuntu-22.04
+            args: ""
+            rust-targets: ""
+          - platform: windows-latest
+            args: ""
+            rust-targets: ""
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Linux only: webkit2gtk is the webview Tauri uses there, plus the
+      # usual build tooling. The other platforms ship their webview already.
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      # Caches the compiled dependency tree. First run is slow; later runs
+      # are a few minutes rather than fifteen.
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      # Fetch MapLibre and Open Sans into dist/vendor so the app does not
+      # depend on a CDN at runtime. Same script you run locally.
+      - name: Vendor frontend assets
+        shell: bash
+        run: bash scripts/vendor-assets.sh
+
+      - name: Build and release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "GPSFlow ${{ github.ref_name }}"
+          releaseBody: |
+            Download the installer for your platform below.
+
+            **Windows** — `.exe` (or `.msi`). Windows will warn that the
+            publisher is unknown: More info → Run anyway.
+
+            **macOS** — `.dmg`. Pick `aarch64` for Apple silicon or `x64` for
+            Intel. The app is unsigned, so the first launch needs
+            right-click → Open rather than a double-click.
+
+            **Linux** — `.AppImage` (runs anywhere, `chmod +x` it first) or
+            `.deb` for Debian and Ubuntu.
+
+            No installer needed: `dist/index.html` opens in any browser and
+            does everything the app does, apart from opening `.gpx` and
+            `.sbp` files by double-click.
+          releaseDraft: true      # review before it goes public
+          prerelease: false
+          args: ${{ matrix.args }}
