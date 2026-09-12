@@ -48,8 +48,12 @@ while read -r url; do
   n=$((n + 1))
   fname="opensans-${n}.woff2"
   curl -fsSL "$url" -o "$fname"
-  # '|' as the sed delimiter, so the slashes in the URL need no escaping.
-  sed -i "s|${url}|${fname}|g" fonts.css
+  # Rewrite through a temp file rather than sed -i. In-place editing is not
+  # portable: GNU sed (Linux, Git Bash) wants `-i`, BSD sed (macOS) wants
+  # `-i ''`, and neither form works on the other. Redirecting sidesteps the
+  # whole argument. '|' is the delimiter so the slashes in the URL need no
+  # escaping.
+  sed "s|${url}|${fname}|g" fonts.css > fonts.css.tmp && mv fonts.css.tmp fonts.css
   echo "    ${fname}"
 done < urls.txt
 
