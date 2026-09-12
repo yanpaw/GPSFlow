@@ -1,162 +1,95 @@
-# GPSFlow — desktop app
+# GPSFlow
 
-Packages the GPX viewer as a native desktop application using [Tauri 2](https://tauri.app).
-You get a real app window with its own icon, no browser chrome, and `.gpx`
-files that open in it when double-clicked.
+A viewer for windsurfing GPS sessions.
 
-Roughly 6–12 MB installed, because Tauri uses the operating system's own web
-view rather than shipping a browser.
+I windsurf as a hobby, and I wanted a quicker way to look at my own tracks
+after a session, so I built this. Sharing it in case it's useful to anyone
+else.
 
----
+<!-- SCREENSHOT: replace this line with a picture of the app with a session
+     loaded. Open a new issue on this repo, drag the image into the comment
+     box, copy the URL GitHub generates, and put  ![GPSFlow](that-url)  here.
+     You don't have to actually submit the issue. -->
 
-## 1. One-time setup
+## What it reads
 
-### Rust
+GPX files and Locosys `.sbp` files, which is what my two watches produce.
 
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
+Other formats can be added — most of these devices write something similar,
+and the work is mostly in figuring out where the fields sit. If you have a
+watch that writes something else, open an issue with a sample file.
 
-Windows: download and run [rustup-init.exe](https://rustup.rs) instead.
+## What it shows
 
-### System dependencies
+- Your track on a map, coloured by speed
+- Distance, duration, top speed, and the number of planing runs
+- Planing runs found automatically, ranked fastest first
+- Best results for the usual categories: top speed, 2 seconds, 100 m, 250 m,
+  500 m and nautical mile, ten of each
+- A timeline of speed against time that you can step through with the arrow
+  keys, with a marker following along the map
+- Click a result to see just that stretch of track; ctrl-drag the timeline to
+  measure any window you like
 
-- **Windows** — install [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
-  (select "Desktop development with C++"). WebView2 is already on Windows 10/11.
-- **macOS** — `xcode-select --install`
-- **Linux (Debian/Ubuntu)**
-  ```bash
-  sudo apt update
-  sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file \
-    libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
-  ```
+## Speed accuracy
 
-### Tauri CLI
+Speed comes from the receiver's own Doppler measurement wherever the file has
+it — GPX `<speed>` elements, and every record in an `.sbp` file — rather than
+being worked out from the distance between positions.
 
-```bash
-cargo install tauri-cli --version "^2.0"
-```
+This makes a real difference. On a 5 Hz log, position-derived speed throws up
+peaks above 70 knots where the receiver reports 32. Distances for the
+distance categories are integrated from the same source, since GPS noise
+otherwise inflates them by a few percent.
 
----
+I've checked the numbers against existing session software and they match.
 
-## 2. Vendor the assets (recommended)
+## Getting it
 
-The app pulls MapLibre GL JS and Open Sans from the internet unless you download
-them locally first. Do this once:
+Installers are on the [Releases page](../../releases).
 
-```bash
-bash scripts/vendor-assets.sh
-```
+| Platform | File | Note |
+|---|---|---|
+| Windows | `.exe` or `.msi` | SmartScreen warns about an unknown publisher: More info → Run anyway |
+| macOS | `.dmg` | Unsigned, so the first launch needs right-click → Open |
+| Linux | `.AppImage` or `.deb` | `chmod +x` the AppImage first |
 
-**Windows:** run this in **Git Bash** (right-click the project folder →
-"Git Bash Here"), not Command Prompt or PowerShell. Note that Git Bash uses
-forward slashes and `/c/` for the C: drive, e.g.
-`cd /c/Users/you/Downloads/windlog-tauri`.
+Once installed, `.gpx` and `.sbp` files open in it when double-clicked.
 
-The script needs only `curl`, `grep` and `sed`, all of which ship with Git
-Bash. No Python required.
+If you'd rather not install anything, `dist/index.html` is the whole app in
+one file. Open it in a browser and everything works except the file
+association.
 
-**The basemap is the exception** — CARTO's vector tiles, sprites and label fonts
-are fetched at runtime and can't be bundled. Offline, a session still shows the
-track, stats, runs and timeline; only the map background will be blank.
+## Keyboard
 
----
-
-## 3. Icons
-
-Already generated from your Teemo drawing — `.ico` for Windows, `.icns` for
-macOS (all eight resolutions), and PNGs for Linux. Nothing to do.
-
-To swap in different artwork later, replace `src-tauri/icons/app-icon.png`
-with a square 1024×1024 PNG and run:
-
-```bash
-cargo tauri icon src-tauri/icons/app-icon.png
-```
-
----
-
-## 4. Run and build
-
-Development, with hot reload of the frontend:
-
-```bash
-cargo tauri dev
-```
-
-Production installers:
-
-```bash
-cargo tauri build
-```
-
-Output lands in `src-tauri/target/release/bundle/`:
-
-| Platform | Artifact |
+| Key | Does |
 |---|---|
-| Windows | `msi/GPSFlow_1.0.0_x64_en-US.msi`, `nsis/…-setup.exe` |
-| macOS | `dmg/GPSFlow_1.0.0_aarch64.dmg`, `macos/GPSFlow.app` |
-| Linux | `deb/…amd64.deb`, `appimage/…AppImage`, `rpm/…rpm` |
+| `←` `→` | Step through the session one sample at a time |
+| `Shift` + `←` `→` | Fifteen at a time |
+| `+` `−` | Zoom the timeline |
+| `Home` `End` | Jump to the start or end |
+| `Ctrl` + drag | Select a time range |
+| `Esc` | Clear the selection |
 
-The first build compiles the whole Rust dependency tree and takes several
-minutes. Later builds are much faster.
+## Notes
 
----
+- Everything happens on your machine. No account, no upload, no tracking.
+- Map tiles come from [CARTO](https://carto.com/basemaps/) and need a
+  connection the first time you look at an area. Offline, you still get the
+  track, stats, runs and timeline on a blank background.
+- A planing run means speed above 18 km/h held for at least 1.2 seconds.
 
-## How file opening works
+## Building it yourself
 
-Each platform hands a double-clicked file to the app differently, so both paths
-are covered in `src-tauri/src/main.rs`:
+See [BUILDING.md](BUILDING.md). Only needed if you want to compile it — the
+Releases page has ready-made installers.
 
-- **Windows / Linux** — the path arrives as the first command-line argument,
-  read at startup in `setup()`.
-- **macOS** — the system sends a `RunEvent::Opened` event instead, both at
-  launch and while the app is already open.
+## Credits
 
-Either way the Rust side reads the file, keeps it in memory, and the frontend
-collects it by calling `take_opened_file` once the UI is ready. Files opened
-later are pushed to the window as a `gpx-opened` event.
+Built by Florian Hallbauer.
 
-The Rust side only accepts paths ending in `.gpx`, since the OS can pass
-anything through a file association.
-
-File associations register at **install** time, so test them with a built
-installer rather than under `cargo tauri dev`.
-
----
-
-## Security posture
-
-- `capabilities/default.json` grants `core:default` only. No filesystem, shell
-  or HTTP plugin is enabled — the app reads GPX through its own narrow Rust
-  command rather than exposing general file access to the web view.
-- The CSP in `tauri.conf.json` allows exactly what's needed: CARTO for tiles,
-  Google Fonts and unpkg only as fallbacks. Once you've vendored assets you can
-  tighten it further by removing the `https://unpkg.com`, `fonts.googleapis.com`
-  and `fonts.gstatic.com` entries.
-
----
-
-## Project layout
-
-```
-windlog-tauri/
-├── dist/
-│   ├── index.html          the viewer (identical to the browser version
-│   │                       plus a small Tauri bridge at the bottom)
-│   └── vendor/             populated by scripts/vendor-assets.sh
-├── scripts/
-│   └── vendor-assets.sh
-└── src-tauri/
-    ├── Cargo.toml
-    ├── build.rs
-    ├── tauri.conf.json     window, bundle and file-association config
-    ├── capabilities/
-    │   └── default.json
-    ├── icons/
-    └── src/
-        └── main.rs
-```
-
-`dist/index.html` still opens directly in a browser — the Tauri bridge is
-inert when `window.__TAURI__` is absent.
+The `.sbp` format was decoded with the help of
+[Logiqx's GPS Wizard format notes](https://logiqx.github.io/gps-wizard/formats/sbp.html).
+Maps use [MapLibre GL JS](https://maplibre.org/) with
+[CARTO](https://carto.com/) basemaps and
+[OpenStreetMap](https://www.openstreetmap.org/copyright) data.
