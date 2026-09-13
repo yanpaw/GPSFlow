@@ -205,6 +205,10 @@
   .icon-btn:hover{ background: var(--panel-2); color: var(--text); }
   .icon-btn[aria-expanded="true"]{ background: var(--panel-2); color: var(--text); border-color: var(--seafoam); }
 
+  /* Fixed width and centred content, because the label alternates between
+     "Dark" and "Light" and the glyph between a moon and a sun. Left to size
+     itself, the button would grow and shrink on every click and nudge the
+     buttons beside it. */
   .theme-toggle{
     background: transparent;
     border: 1px solid var(--line-strong);
@@ -216,8 +220,16 @@
     cursor: pointer;
     display: inline-flex;
     align-items: center;
+    justify-content: center;
     gap: 6px;
     white-space: nowrap;
+    min-width: 84px;
+  }
+  /* Same treatment for the glyph itself. */
+  .theme-toggle #themeIcon{
+    display: inline-block;
+    width: 12px;
+    text-align: center;
   }
   .theme-toggle:hover{ background: var(--panel-2); color: var(--text); }
 
@@ -821,7 +833,7 @@
         <button id="tlZoomOut" title="Zoom out (−)">&minus;</button>
         <button id="tlZoomIn" title="Zoom in (+)">+</button>
       </span>
-      <span class="tl-hint">← → move &middot; shift = faster &middot; +/− zoom &middot; ctrl+drag = select &middot; click track to jump &middot; esc clears</span>
+      <span class="tl-hint">← → move &middot; shift = faster &middot; +/− zoom &middot; ctrl+drag = select &middot; ctrl+click results to compare &middot; esc clears</span>
     </div>
     <div class="tl-canvas-wrap">
       <canvas id="timelineCanvas"></canvas>
@@ -877,7 +889,7 @@
    *  Set by clicking a run (which selects that run's extent) or by
    *  ctrl-dragging across the timeline. Drives the map highlight, the
    *  timeline shading and the summary chip. */
-  let selection = null;   // {startT, endT}
+  let selections = [];    // [{startT, endT}, ...] - several can be picked at once
 
   /** Best result per category, as returned by computeBests(). */
   let bests = [];
@@ -1641,16 +1653,19 @@
       return Math.min(BANDS-1, Math.floor(t * BANDS));
     };
 
-    // With a selection, draw ONLY that stretch - the rest is left off the map
-    // rather than dimmed, so the selected part keeps its own speed colours.
-    const sel = selectionRange();
-    const from = sel ? sel[0] : 0;
-    const to   = sel ? sel[1] : points.length - 1;
-    const stride = Math.max(1, Math.ceil((to - from) / MAX_MAP_SEGMENTS));
+    // With a selection, draw ONLY those stretches - the rest is left off the
+    // map rather than dimmed, so what remains keeps its own speed colours.
+    // Several stretches can be selected at once, which is the point: two runs
+    // side by side on the same map is how you compare them.
+    const ranges = selectionRanges();
+    const spans = ranges.length ? ranges : [[0, points.length - 1]];
 
-    const features = [];
-    let currentBand = null, currentPath = [], currentValid = null;
+    const drawn = spans.reduce((n, [f, t]) => n + (t - f), 0);
+    const stride = Math.max(1, Math.ceil(drawn / MAX_MAP_SEGMENTS));
+
+    const features = [], endFeatures = [];
     let minLng = Infinity, minLat = Infinity, maxLng = -Infinity, maxLat = -Infinity;
+    let currentBand = null, currentPath = [], currentValid = null;
 
     const flush = () => {
       if (currentPath.length < 2) return;
@@ -1667,49 +1682,61 @@
       });
     };
 
-    for (let i=from; i<=to; i+=stride){
-      const p = points[i];
-      const coord = [p.lon, p.lat];          // GeoJSON is lng,lat
-      if (p.lon < minLng) minLng = p.lon;
-      if (p.lon > maxLng) maxLng = p.lon;
-      if (p.lat < minLat) minLat = p.lat;
-      if (p.lat > maxLat) maxLat = p.lat;
+    spans.forEach(([from, to]) => {
+      // Each stretch starts a fresh line: they are separate pieces of water
+      // and must not be joined by a phantom segment across the gap.
+      flush();
+      currentPath = []; currentBand = null; currentValid = null;
 
-      const valid = !hasTime || !p.isGap;
-      const band = (valid && hasTime) ? bandOf(p.speed) : -1;
-      if (band !== currentBand || valid !== currentValid){
-        flush();
-        currentPath = currentPath.length ? [currentPath[currentPath.length-1], coord] : [coord];
-        currentBand = band;
-        currentValid = valid;
-      } else {
-        currentPath.push(coord);
+      for (let i = from; i <= to; i += stride){
+        const p = points[i];
+        const coord = [p.lon, p.lat];          // GeoJSON is lng,lat
+        if (p.lon < minLng) minLng = p.lon;
+        if (p.lon > maxLng) maxLng = p.lon;
+        if (p.lat < minLat) minLat = p.lat;
+        if (p.lat > maxLat) maxLat = p.lat;
+
+        const valid = !hasTime || !p.isGap;
+        const band = (valid && hasTime) ? bandOf(p.speed) : -1;
+        if (band !== currentBand || valid !== currentValid){
+          flush();
+          currentPath = currentPath.length ? [currentPath[currentPath.length-1], coord] : [coord];
+          currentBand = band;
+          currentValid = valid;
+        } else {
+          currentPath.push(coord);
+        }
       }
-    }
-    if ((to - from) % stride !== 0){
-      const endPt = points[to];
-      currentPath.push([endPt.lon, endPt.lat]);
-    }
-    flush();
+      // Make sure the final point lands even when stride overshoots it.
+      if ((to - from) % stride !== 0){
+        const endPt = points[to];
+        currentPath.push([endPt.lon, endPt.lat]);
+        if (endPt.lon < minLng) minLng = endPt.lon;
+        if (endPt.lon > maxLng) maxLng = endPt.lon;
+        if (endPt.lat < minLat) minLat = endPt.lat;
+        if (endPt.lat > maxLat) maxLat = endPt.lat;
+      }
+      flush();
+      currentPath = [];
 
-    map.getSource("track").setData({ type: "FeatureCollection", features });
-
-    // ---- endpoints ----
-    const first = points[from], last = points[to];
-    map.getSource("ends").setData({
-      type: "FeatureCollection",
-      features: [
+      // Entry and exit dots for every stretch drawn.
+      const first = points[from], last = points[to];
+      endFeatures.push(
         { type:"Feature", properties:{ color: themeColor("--sand") },
           geometry:{ type:"Point", coordinates:[first.lon, first.lat] } },
         { type:"Feature", properties:{ color: themeColor("--text") },
           geometry:{ type:"Point", coordinates:[last.lon, last.lat] } }
-      ]
+      );
     });
 
+    map.getSource("track").setData({ type: "FeatureCollection", features });
+    map.getSource("ends").setData({ type: "FeatureCollection", features: endFeatures });
+
     // ---- run pins, only those inside what is drawn ----
+    const inSpan = (i) => spans.some(([f, t]) => i >= f && i <= t);
     const runFeatures = [];
     waves.forEach((w, idx) => {
-      if (w.peakIdx < from || w.peakIdx > to) return;
+      if (!inSpan(w.peakIdx)) return;
       runFeatures.push({
         type: "Feature",
         properties: { rank: String(idx + 1) },
@@ -1719,7 +1746,7 @@
     map.getSource("runs").setData({ type:"FeatureCollection", features: runFeatures });
 
     // ---- fit, but only when what is shown has actually changed ----
-    const fitKey = from + ":" + to;
+    const fitKey = spans.map(r => r.join("-")).join(",");
     if (fitKey !== lastFitKey && isFinite(minLng)){
       if (minLng !== maxLng || minLat !== maxLat){
         map.fitBounds([[minLng, minLat], [maxLng, maxLat]],
@@ -1816,54 +1843,80 @@
       const frac = Math.max(0, Math.min(1, r.speed / top));
       div.style.setProperty("--bar", (35 + frac * 65).toFixed(1) + "%");
 
-      div.addEventListener("click", () => focusResult(idx));
+      div.addEventListener("click", (e) => focusResult(idx, e.ctrlKey || e.metaKey || e.shiftKey));
       el.appendChild(div);
     });
+
+    // The rows were just rebuilt, so re-apply the highlight for anything
+    // still selected - a unit switch should not look like a deselection.
+    markSelectedRows();
   }
 
   /** Select a row from the results box: highlight the stretch it came from. */
-  function focusResult(idx){
+  /** Select a row from the results box.
+   *
+   *  A plain click replaces the selection; ctrl, cmd or shift adds the row
+   *  to it instead, so several runs can sit on the map together and be
+   *  compared. Clicking an already-selected row with the modifier held takes
+   *  it back off again. */
+  function focusResult(idx, additive){
     const r = currentResults[idx];
     if (!r) return;
-    document.querySelectorAll(".wave-item").forEach((n,i) => n.classList.toggle("pulse", i===idx));
-    setSelection(r.startT, r.endT);
-    setCursorToTime(r.startT);
+    if (additive) toggleSelection(r.startT, r.endT);
+    else setSelection(r.startT, r.endT);
+    // Only move the cursor when the row is now selected, otherwise removing
+    // one would drag the timeline off to a stretch you just dismissed.
+    if (isSelected(r.startT, r.endT)) setCursorToTime(r.startT);
   }
 
   // ============================================================
   // SELECTION
-  // A time window, chosen either by clicking a run or by ctrl-dragging on
-  // the timeline. One piece of state drives three views: the map highlight,
-  // the timeline shading, and the summary chip.
+  // A set of time windows, chosen by clicking results or ctrl-dragging the
+  // timeline. Ctrl-clicking additional results adds them rather than
+  // replacing, which is how two runs end up on the map side by side. One
+  // piece of state drives three views: what the map draws, the timeline
+  // shading, and the summary chip.
   // ============================================================
 
-  /** Indices of the points falling inside the selected window. */
-  function selectionRange(){
-    if (!selection) return null;
-    const a = idxAtTime(selection.startT);
-    let b = idxAtTime(selection.endT);
-    if (b < a) b = a;
-    return [a, b];
+  /** Index ranges covered by the current selection, sorted and merged.
+   *
+   *  Overlapping picks are merged so the map never draws the same stretch
+   *  twice, and so the combined stats do not count it twice either. */
+  function selectionRanges(){
+    if (!selections.length) return [];
+    const raw = selections.map(sel => {
+      const a = idxAtTime(sel.startT);
+      let b = idxAtTime(sel.endT);
+      if (b < a) b = a;
+      return [a, b];
+    }).sort((x, y) => x[0] - y[0]);
+
+    const merged = [raw[0].slice()];
+    for (let i = 1; i < raw.length; i++){
+      const last = merged[merged.length - 1];
+      if (raw[i][0] <= last[1]) last[1] = Math.max(last[1], raw[i][1]);
+      else merged.push(raw[i].slice());
+    }
+    return merged;
   }
 
-  /** Distance, duration and speeds for the selected window. */
+  /** Distance, duration and speeds across everything selected. */
   function selectionStats(){
-    const range = selectionRange();
-    if (!range) return null;
-    const [a, b] = range;
-    let dist = 0, maxSpeed = 0, movingTime = 0;
-    for (let i = a + 1; i <= b; i++){
-      const p = points[i];
-      dist += p.dist || 0;
-      if (p.validSeg){
-        movingTime += p.dt;
-        if (p.speed > maxSpeed) maxSpeed = p.speed;
+    const ranges = selectionRanges();
+    if (!ranges.length) return null;
+    let dist = 0, maxSpeed = 0, dur = 0;
+    for (const [a, b] of ranges){
+      for (let i = a + 1; i <= b; i++){
+        const p = points[i];
+        dist += p.dist || 0;
+        if (p.validSeg && p.speed > maxSpeed) maxSpeed = p.speed;
       }
+      dur += points[b].t - points[a].t;
     }
-    const dur = points[b].t - points[a].t;
-    // Average over elapsed time, matching how the session stats read.
+    // Average over the selected time only - with several stretches picked,
+    // the gaps between them are somebody else's problem.
     const avg = dur > 0 ? dist / dur : 0;
-    return { dist, dur, maxSpeed, avg, movingTime };
+    return { dist, dur, maxSpeed, avg, count: ranges.length };
   }
 
   function updateSelectionChip(){
@@ -1872,8 +1925,15 @@
     const st = selectionStats();
     if (!st){ chip.classList.remove("on"); text.textContent = ""; return; }
     chip.classList.add("on");
+
+    // One stretch gets its clock times; several get a count instead, since
+    // a start and end time means nothing across scattered pieces.
+    const head = st.count === 1
+      ? `${fmtWall(selections[0].startT, true)} &rarr; ${fmtWall(selections[0].endT, true)}`
+      : `<b>${st.count}</b> selected`;
+
     text.innerHTML =
-      `${fmtWall(selection.startT, true)} &rarr; ${fmtWall(selection.endT, true)}` +
+      head +
       ` &middot; ${st.dur.toFixed(0)}s` +
       ` &middot; ${toDistUnit(st.dist).toFixed(2)} ${DIST_LABEL[unit]}` +
       ` &middot; max <b>${toUnit(st.maxSpeed).toFixed(1)}</b>` +
@@ -1882,36 +1942,66 @@
 
   /** Redraw the map for the current selection.
    *
-   *  There is no highlight overlay: drawTrack() simply renders the selected
-   *  stretch and nothing else, so the visible line keeps its ordinary speed
-   *  colours. Fitting the view is left to drawTrack's own fitBounds, which
-   *  is already computed from whatever it drew. */
+   *  There is no highlight overlay: drawTrack() renders the selected
+   *  stretches and nothing else, so the visible line keeps its ordinary
+   *  speed colours. */
   function drawSelectionOnMap(){
     if (!map) return;
     try { drawTrack(); } catch (e){ console.error("Map redraw failed:", e); }
   }
 
-  /** Set the selected window. Times may arrive in either order. */
-  function setSelection(t0, t1, opts){
-    opts = opts || {};
+  /** Replace the selection with a single window. */
+  function setSelection(t0, t1){
     const lo = Math.min(t0, t1), hi = Math.max(t0, t1);
     // A ctrl-click with no drag is a clear, not a zero-width selection.
     if (hi - lo < 1){ clearSelection(); return; }
-    selection = { startT: lo, endT: hi };
+    selections = [{ startT: lo, endT: hi }];
+    afterSelectionChange();
+  }
+
+  /** Add a window, or remove it if that same window is already picked.
+   *  This is what makes comparing two runs on one map possible. */
+  function toggleSelection(t0, t1){
+    const lo = Math.min(t0, t1), hi = Math.max(t0, t1);
+    if (hi - lo < 1) return;
+    const at = selections.findIndex(s =>
+      Math.abs(s.startT - lo) < 0.001 && Math.abs(s.endT - hi) < 0.001);
+    if (at >= 0) selections.splice(at, 1);
+    else selections.push({ startT: lo, endT: hi });
+    afterSelectionChange();
+  }
+
+  /** True when this exact window is currently selected. */
+  function isSelected(t0, t1){
+    return selections.some(s =>
+      Math.abs(s.startT - t0) < 0.001 && Math.abs(s.endT - t1) < 0.001);
+  }
+
+  function afterSelectionChange(){
     drawSelectionOnMap();
     updateSelectionChip();
+    markSelectedRows();
     scheduleTimeline();
   }
 
   function clearSelection(){
-    const had = selection !== null;
-    selection = null;
+    const had = selections.length > 0;
+    selections = [];
     document.querySelectorAll(".wave-item").forEach(n => n.classList.remove("pulse"));
+    document.querySelectorAll(".best-chip").forEach(n => n.classList.remove("dim"));
     updateSelectionChip();
     // Only redraw if something was actually showing, so this stays cheap
     // when called during setup.
     if (had) drawSelectionOnMap();
     scheduleTimeline();
+  }
+
+  /** Highlight every result row whose stretch is currently selected. */
+  function markSelectedRows(){
+    document.querySelectorAll(".wave-item").forEach((node, i) => {
+      const r = currentResults[i];
+      node.classList.toggle("pulse", !!r && isSelected(r.startT, r.endT));
+    });
   }
 
   // ============================================================
@@ -2158,34 +2248,45 @@
       ctx.fillRect(Math.max(padL, x0), padT, Math.min(cssW - padR, x1) - Math.max(padL, x0), plotH);
     });
 
-    // ---- selection: dim everything outside the chosen window, and mark
-    // its edges. Drawn after the trace so the dimming actually reads.
-    const activeSel = tlSelecting ? { startT: Math.min(tlSelAnchor, tlSelCurrent),
-                                      endT:   Math.max(tlSelAnchor, tlSelCurrent) }
-                                  : selection;
-    if (activeSel){
-      const sx0 = Math.max(padL, xOf(activeSel.startT));
-      const sx1 = Math.min(cssW - padR, xOf(activeSel.endT));
+    // ---- selection: dim everything outside the chosen windows, and mark
+    // their edges. Drawn after the trace so the dimming actually reads.
+    // A drag in progress previews as if it were the only selection.
+    const active = tlSelecting
+      ? [{ startT: Math.min(tlSelAnchor, tlSelCurrent),
+           endT:   Math.max(tlSelAnchor, tlSelCurrent) }]
+      : selections;
 
+    if (active.length){
+      // Dim the whole plot, then clear the selected windows back out of it,
+      // which handles any number of stretches without gaps or double-dimming.
+      const bounds = active
+        .map(sel => [Math.max(padL, xOf(sel.startT)), Math.min(cssW - padR, xOf(sel.endT))])
+        .filter(([x0, x1]) => x1 > x0)
+        .sort((a, b) => a[0] - b[0]);
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(padL, padT, plotW, plotH);
+      bounds.forEach(([x0, x1]) => ctx.rect(x0, padT, x1 - x0, plotH));
       ctx.fillStyle = cDim;
-      if (sx0 > padL) ctx.fillRect(padL, padT, sx0 - padL, plotH);
-      if (sx1 < cssW - padR) ctx.fillRect(sx1, padT, (cssW - padR) - sx1, plotH);
+      ctx.fill("evenodd");          // outer rect minus the selected windows
+      ctx.restore();
 
-      if (sx1 > sx0){
+      bounds.forEach(([x0, x1]) => {
         ctx.strokeStyle = cSelEdge;
         ctx.lineWidth = 1.5;
         ctx.beginPath();
-        ctx.moveTo(sx0 + 0.5, padT); ctx.lineTo(sx0 + 0.5, padT + plotH);
-        ctx.moveTo(sx1 - 0.5, padT); ctx.lineTo(sx1 - 0.5, padT + plotH);
+        ctx.moveTo(x0 + 0.5, padT); ctx.lineTo(x0 + 0.5, padT + plotH);
+        ctx.moveTo(x1 - 0.5, padT); ctx.lineTo(x1 - 0.5, padT + plotH);
         ctx.stroke();
 
-        // little handles top and bottom, so the edges read as grabbable bounds
+        // little handles top and bottom, so the edges read as bounds
         ctx.fillStyle = cSelEdge;
-        [sx0, sx1].forEach(x => {
+        [x0, x1].forEach(x => {
           ctx.fillRect(x - 1.5, padT, 3, 5);
           ctx.fillRect(x - 1.5, padT + plotH - 5, 3, 5);
         });
-      }
+      });
     }
 
     // ---- cursor
@@ -2240,19 +2341,24 @@
    *  equally "nearest", and the earliest of them wins. */
   function nearestPointIndex(latlng, maxPixels){
     if (!points.length || !map) return -1;
-    const range = selectionRange();
-    const from = range ? range[0] : 0;
-    const to   = range ? range[1] : points.length - 1;
+
+    // Search only what is actually drawn, so a click cannot land on a
+    // stretch that is currently hidden. With nothing selected that is the
+    // whole track; with runs selected it is just those.
+    const ranges = selectionRanges();
+    const spans = ranges.length ? ranges : [[0, points.length - 1]];
 
     // Coarse pass in degree space (cheap), scaled so longitude doesn't
     // dominate at this latitude.
     const cosLat = Math.cos(latlng.lat * Math.PI / 180);
     let bestIdx = -1, bestD2 = Infinity;
-    for (let i = from; i <= to; i++){
-      const dLat = points[i].lat - latlng.lat;
-      const dLon = (points[i].lon - latlng.lng) * cosLat;
-      const d2 = dLat*dLat + dLon*dLon;
-      if (d2 < bestD2){ bestD2 = d2; bestIdx = i; }
+    for (const [from, to] of spans){
+      for (let i = from; i <= to; i++){
+        const dLat = points[i].lat - latlng.lat;
+        const dLon = (points[i].lon - latlng.lng) * cosLat;
+        const d2 = dLat*dLat + dLon*dLon;
+        if (d2 < bestD2){ bestD2 = d2; bestIdx = i; }
+      }
     }
     if (bestIdx < 0) return -1;
 
@@ -2472,6 +2578,33 @@
     if (f) handleFile(f);
   });
 
+  // ---------------- Page zoom suppression ----------------
+  //
+  // A trackpad pinch arrives as ctrl+wheel. Left alone the webview zooms the
+  // whole interface, which is never wanted here: the layout is pinned to the
+  // viewport, and the map and timeline both have their own zoom. Suppressing
+  // it globally is simpler than trying to catch every element that isn't the
+  // map, and it cannot misfire - nothing in the app wants page zoom.
+  //
+  // The map and timeline attach their own wheel handlers to their own
+  // elements, which run before this one and are unaffected.
+  window.addEventListener("wheel", (e) => {
+    if (e.ctrlKey) e.preventDefault();
+  }, { passive: false });
+
+  // WebKit - which is what the macOS and Linux builds use - sends pinch as
+  // gesture events rather than ctrl+wheel.
+  ["gesturestart", "gesturechange", "gestureend"].forEach(evt => {
+    window.addEventListener(evt, (e) => e.preventDefault(), { passive: false });
+  });
+
+  // Ctrl and +/-/0 does the same job from the keyboard.
+  window.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && ["+", "-", "=", "_", "0"].includes(e.key)){
+      e.preventDefault();
+    }
+  });
+
   // ---------------- Display menu ----------------
   const displayBtn  = document.getElementById("displayBtn");
   const displayMenu = document.getElementById("displayMenu");
@@ -2674,6 +2807,8 @@
     if (!points.length || !hasTime) return;
     const tag = (e.target.tagName || "").toLowerCase();
     if (tag === "input" || tag === "textarea") return;
+    // Ctrl/Cmd combinations belong to the browser, not the timeline.
+    if (e.ctrlKey || e.metaKey) return;
 
     const fast = e.shiftKey ? 15 : 1;
     switch (e.key){
@@ -2683,7 +2818,7 @@
       case "End":        e.preventDefault(); tlCursorIdx = points.length-1; ensureCursorVisible(); updateReadout(); updateCursorMarker(); scheduleTimeline(); break;
       case "+": case "=": e.preventDefault(); zoomTimeline(0.5); break;
       case "-": case "_": e.preventDefault(); zoomTimeline(2); break;
-      case "Escape": if (selection){ e.preventDefault(); clearSelection(); } break;
+      case "Escape": if (selections.length){ e.preventDefault(); clearSelection(); } break;
       default: return;
     }
   });
