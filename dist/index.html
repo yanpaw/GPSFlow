@@ -1432,17 +1432,7 @@
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-left");
     map.touchZoomRotate.disableRotation();
 
-    // How far one wheel notch zooms.
-    //
-    // MapLibre turns wheel deltas into zoom at a fixed rate, but the delta a
-    // single notch reports is not the same in every engine - the desktop
-    // webview and a browser hand over different numbers, so identical code
-    // zooms noticeably less per notch in one than the other. Setting the
-    // rates explicitly makes it behave the same everywhere. Higher is
-    // faster; the library defaults are 1/450 for a wheel and 1/100 for a
-    // trackpad, and these are roughly double that.
-    map.scrollZoom.setWheelZoomRate(1 / 200);
-    map.scrollZoom.setZoomRate(1 / 60);
+    wireSmoothZoom();
 
     map.on("load", () => {
       mapReady = true;
@@ -1467,6 +1457,72 @@
     });
 
     wireMapClick();
+  }
+
+  /** Continuous wheel zoom.
+   *
+   *  Two problems with the stock handler. It applies each notch as its own
+   *  discrete step, which reads as jumpy; and it derives the step size from
+   *  the raw wheel delta, a number that differs between browser engines, so
+   *  the same scroll travelled a different distance in the desktop app than
+   *  in a browser.
+   *
+   *  This keeps a TARGET zoom and asks MapLibre to animate towards it once
+   *  per wheel event. Notches arriving in quick succession push the target
+   *  further out and the in-flight animation simply retargets, so a fast
+   *  scroll is one continuous movement rather than a queue of little jumps.
+   *
+   *  An earlier version drove the camera itself every animation frame. That
+   *  fired the full move-event cascade sixty times a second, which cost more
+   *  than it bought - MapLibre's own animation loop does the same job with a
+   *  fraction of the overhead.
+   */
+  function wireSmoothZoom(){
+    map.scrollZoom.disable();
+
+    // Tuning. STEP is how far one notch travels, EASE_MS how long it takes.
+    // Bigger step = faster; longer ease = smoother but less immediate.
+    const STEP     = 0.42;
+    const EASE_MS  = 190;
+    const MAX_MULT = 2.5;    // clamp, so a violent flick cannot teleport
+
+    let target = null, idle = null;
+    const container = map.getCanvasContainer();
+
+    container.addEventListener("wheel", (e) => {
+      e.preventDefault();
+
+      // deltaMode: 0 = pixels, 1 = lines, 2 = pages. Normalise to pixels,
+      // then to "notches" - a mouse reports about 100 per notch, a trackpad
+      // streams much smaller values.
+      let delta = e.deltaY;
+      if (e.deltaMode === 1) delta *= 16;
+      else if (e.deltaMode === 2) delta *= 100;
+
+      const mult = Math.min(MAX_MULT, Math.max(0.2, Math.abs(delta) / 100));
+      const dir  = delta > 0 ? -1 : 1;
+      const scale = e.ctrlKey ? 2 : 1;      // trackpad pinch feels better faster
+
+      const from = target === null ? map.getZoom() : target;
+      target = Math.max(map.getMinZoom(),
+               Math.min(map.getMaxZoom(), from + dir * STEP * mult * scale));
+
+      // Zoom about the pointer so whatever is under the cursor stays put.
+      const rect = container.getBoundingClientRect();
+      const around = map.unproject([e.clientX - rect.left, e.clientY - rect.top]);
+
+      map.easeTo({
+        zoom: target,
+        around,
+        duration: EASE_MS,
+        easing: (t) => t,        // linear, so chained notches do not stutter
+      });
+
+      // Once scrolling stops, forget the target - otherwise a later pan or a
+      // fitBounds would be fighting a stale value.
+      clearTimeout(idle);
+      idle = setTimeout(() => { target = null; }, 260);
+    }, { passive: false });
   }
 
   /** Point the map at a different basemap style, keeping the current view. */
