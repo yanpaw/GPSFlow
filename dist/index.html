@@ -2581,10 +2581,10 @@
   // ---------------- Page zoom suppression ----------------
   //
   // A trackpad pinch arrives as ctrl+wheel. Left alone the webview zooms the
-  // whole interface, which is never wanted here: the layout is pinned to the
-  // viewport, and the map and timeline both have their own zoom. Suppressing
-  // it globally is simpler than trying to catch every element that isn't the
-  // map, and it cannot misfire - nothing in the app wants page zoom.
+  // whole interface, which is never what the gesture meant here: the layout
+  // is pinned to the viewport, and the map and timeline both have their own
+  // zoom. Pinching is easy to do by accident, so it is suppressed globally -
+  // simpler than catching every element that isn't the map.
   //
   // The map and timeline attach their own wheel handlers to their own
   // elements, which run before this one and are unaffected.
@@ -2598,12 +2598,8 @@
     window.addEventListener(evt, (e) => e.preventDefault(), { passive: false });
   });
 
-  // Ctrl and +/-/0 does the same job from the keyboard.
-  window.addEventListener("keydown", (e) => {
-    if ((e.ctrlKey || e.metaKey) && ["+", "-", "=", "_", "0"].includes(e.key)){
-      e.preventDefault();
-    }
-  });
+  // Keyboard zoom (Ctrl and +/-/0) is deliberately left alone. Someone who
+  // presses it means it, and it is the only way to make the interface bigger.
 
   // ---------------- Display menu ----------------
   const displayBtn  = document.getElementById("displayBtn");

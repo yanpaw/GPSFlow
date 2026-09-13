@@ -53,7 +53,7 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Linux only: webkit2gtk is the webview Tauri uses there, plus the
       # usual build tooling. The other platforms ship their webview already.
@@ -73,15 +73,21 @@ jobs:
             libxdo-dev \
             libssl-dev
 
+      # rustup ships on every GitHub runner, so this needs no action at all -
+      # one less third-party dependency to keep up to date.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust-targets }}
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          if [ -n "${{ matrix.rust-targets }}" ]; then
+            rustup target add ${{ matrix.rust-targets }}
+          fi
 
       # Caches the compiled dependency tree. First run is slow; later runs
       # are a few minutes rather than fifteen.
       - name: Cache Rust build
-        uses: swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@v2.9.0
         with:
           workspaces: "./src-tauri -> target"
 
